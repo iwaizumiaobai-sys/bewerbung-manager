@@ -23,8 +23,22 @@ from openpyxl.utils import get_column_letter
 # ---------------------------------------------------------------- Einstellungen
 
 FIRMA = "Places to Be"
-FARBE = "#2F6B4F"          # Kopfbereich. Hier die Firmenfarbe eintragen.
-FARBE_HELL = "#E8F0EA"
+FARBE = "#1B3A8C"          # Hauptfarbe aus dem Logo. Kopfbereich und Knoepfe.
+FARBE_HELL = "#E9EFFB"     # Sehr helle Variante fuer Flaechen.
+AKZENT = "#D42B27"         # Das Rot aus dem Logo, sparsam eingesetzt.
+
+
+def abdunkeln(hexwert, anteil=0.35):
+    """Macht eine Farbe dunkler, fuer den Verlauf im Kopfbereich."""
+    hexwert = hexwert.lstrip("#")
+    r, g, b = (int(hexwert[i:i + 2], 16) for i in (0, 2, 4))
+    return "#%02x%02x%02x" % tuple(int(k * (1 - anteil)) for k in (r, g, b))
+
+
+def kuerzel_aus(name):
+    """Bildet ein Kuerzel, falls kein Logo hinterlegt ist."""
+    teile = [w for w in re.split(r"\s+", name) if w]
+    return "".join(w[0] for w in teile[:3]).upper() or "?"
 AUFBEWAHRUNG_TAGE = 3
 
 DB = os.environ.get("DB_PATH", "/tmp/bewerbungen.db")
@@ -100,17 +114,38 @@ def html_zu_text(roh):
     return re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t]{2,}", " ", roh)).strip()
 
 
+def pdf_zu_text(rohdaten):
+    """Liest den Text aus einer PDF. Gibt leeren String zurueck, wenn es nicht geht."""
+    try:
+        from pypdf import PdfReader
+
+        leser = PdfReader(io.BytesIO(rohdaten))
+        seiten = [(s.extract_text() or "") for s in leser.pages[:15]]
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(seiten)).strip()
+    except Exception:
+        return ""
+
+
 def eml_lesen(rohdaten):
     msg = email.message_from_bytes(rohdaten)
     absender = kopf(msg.get("From"))
     betreff = kopf(msg.get("Subject"))
 
-    text, html = "", ""
+    text, html, anhaenge = "", "", []
     if msg.is_multipart():
         for teil in msg.walk():
             if teil.get_content_maintype() == "multipart":
                 continue
-            if "attachment" in str(teil.get("Content-Disposition", "")):
+            dateiname = kopf(teil.get_filename() or "")
+            ist_anhang = ("attachment" in str(teil.get("Content-Disposition", ""))
+                          or dateiname)
+            if ist_anhang:
+                if dateiname.lower().endswith(".pdf"):
+                    inhalt = teil.get_payload(decode=True)
+                    if inhalt:
+                        gelesen = pdf_zu_text(inhalt)
+                        if gelesen:
+                            anhaenge.append(f"[Anhang {dateiname}]\n{gelesen}")
                 continue
             try:
                 inhalt = teil.get_payload(decode=True)
@@ -134,6 +169,8 @@ def eml_lesen(rohdaten):
             text = entpackt
 
     koerper = text.strip() or html_zu_text(html)
+    if anhaenge:
+        koerper = (koerper + "\n\n" + "\n\n".join(anhaenge)).strip()
 
     name = absender
     if "<" in absender:
@@ -146,6 +183,34 @@ def eml_lesen(rohdaten):
 
 
 # ---------------------------------------------------------------- Bewertung
+
+def mail_raten(text):
+    treffer = re.search(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", text)
+    return treffer.group(0).rstrip(".,;:") if treffer else ""
+
+
+def name_raten(text, dateiname=""):
+    """Sucht den Namen: erst in der Grussformel am Ende, dann im Dateinamen."""
+    schluss = text[-400:]
+    for muster in (r"(?:Viele|Beste|Freundliche|Liebe|Herzliche)\s+Gr[uü][sß]{1,2}e,?\s*\n+\s*"
+                   r"([A-ZÄÖÜ][\wäöüß'-]+(?:\s+[A-ZÄÖÜ][\wäöüß'-]+){0,2})",
+                   r"Mit freundlichen Gr[uü][sß]{1,2}en,?\s*\n+\s*"
+                   r"([A-ZÄÖÜ][\wäöüß'-]+(?:\s+[A-ZÄÖÜ][\wäöüß'-]+){0,2})"):
+        treffer = re.search(muster, schluss)
+        if treffer:
+            return treffer.group(1).strip()
+
+    treffer = re.search(r"(?:mein Name ist|Ich hei[sß]e)\s+"
+                        r"([A-ZÄÖÜ][\wäöüß'-]+(?:\s+[A-ZÄÖÜ][\wäöüß'-]+){0,2})", text[:1500])
+    if treffer:
+        return treffer.group(1).strip()
+
+    roh = re.sub(r"\.[^.]+$", "", dateiname)
+    roh = re.sub(r"(?i)bewerbung|lebenslauf|anschreiben|cv|final|neu", " ", roh)
+    roh = re.sub(r"[_\-.]+", " ", roh).strip()
+    woerter = [w for w in roh.split() if len(w) > 1 and not w.isdigit()][:3]
+    return " ".join(w.capitalize() for w in woerter) or "Unbekannt"
+
 
 PROMPT = """Du hilfst einer Fundraising-Agentur bei der Vorsortierung von Bewerbungen
 fuer die Taetigkeit als Werber an Infostaenden (Mitgliederwerbung fuer gemeinnuetzige
@@ -264,32 +329,62 @@ def seite():
         f'<div class="spur"><i id="b-{key}"></i></div></div>'
         for key, titel, gewicht in KRITERIEN
     )
-    return SEITE.replace("{{FIRMA}}", FIRMA).replace("{{FARBE}}", FARBE) \
-                .replace("{{FARBE_HELL}}", FARBE_HELL).replace("{{BALKEN}}", balken) \
-                .replace("{{TAGE}}", str(AUFBEWAHRUNG_TAGE))
+    return (SEITE.replace("{{FIRMA}}", FIRMA)
+                 .replace("{{KUERZEL}}", kuerzel_aus(FIRMA))
+                 .replace("{{FARBE_DUNKEL}}", abdunkeln(FARBE))
+                 .replace("{{FARBE_HELL}}", FARBE_HELL)
+                 .replace("{{AKZENT}}", AKZENT)
+                 .replace("{{FARBE}}", FARBE)
+                 .replace("{{BALKEN}}", balken)
+                 .replace("{{TAGE}}", str(AUFBEWAHRUNG_TAGE)))
+
+
+LOGO_URL = os.environ.get("LOGO_URL", "")   # Falls kein logo.png im Repo liegt.
 
 
 @app.get("/static/logo.png")
 def logo():
-    from fastapi.responses import FileResponse
+    from fastapi.responses import FileResponse, RedirectResponse
 
     if os.path.exists("logo.png"):
         return FileResponse("logo.png")
+    if LOGO_URL:
+        return RedirectResponse(LOGO_URL)
     return JSONResponse({"fehler": "kein Logo hinterlegt"}, 404)
 
 
 @app.post("/api/upload")
 async def upload(file: UploadFile = File(...)):
     rohdaten = await file.read()
-    name = (file.filename or "").lower()
-    if not name.endswith(".eml"):
-        return JSONResponse({"fehler": "Bitte eine .eml-Datei hochladen."}, 400)
-    try:
-        daten = eml_lesen(rohdaten)
-    except Exception as fehler:
-        return JSONResponse({"fehler": f"Datei nicht lesbar: {fehler}"}, 400)
+    dateiname = file.filename or ""
+    endung = dateiname.lower().rsplit(".", 1)[-1] if "." in dateiname else ""
+
+    if endung == "eml":
+        try:
+            daten = eml_lesen(rohdaten)
+        except Exception as fehler:
+            return JSONResponse({"fehler": f"Datei nicht lesbar: {fehler}"}, 400)
+
+    elif endung == "pdf":
+        text = pdf_zu_text(rohdaten)
+        if not text:
+            return JSONResponse(
+                {"fehler": "Aus dieser PDF laesst sich kein Text lesen. "
+                           "Vermutlich ein Scan — bitte den Text von Hand einfuegen."}, 400)
+        daten = {"name": name_raten(text, dateiname), "absender": mail_raten(text),
+                 "betreff": f"Bewerbung ({dateiname})", "text": text}
+
+    elif endung in ("txt", "text", "md", "rtf"):
+        text = rohdaten.decode("utf-8", errors="replace")
+        daten = {"name": name_raten(text, dateiname), "absender": mail_raten(text),
+                 "betreff": f"Bewerbung ({dateiname})", "text": text}
+
+    else:
+        return JSONResponse(
+            {"fehler": "Moegliche Formate: .eml, .pdf, .txt"}, 400)
+
     if not daten["text"].strip():
-        return JSONResponse({"fehler": "Die Mail enthaelt keinen Text."}, 400)
+        return JSONResponse({"fehler": "Die Datei enthaelt keinen Text."}, 400)
     return verarbeiten(daten)
 
 
@@ -406,30 +501,43 @@ SEITE = """<!doctype html><html lang="de"><head><meta charset="utf-8">
 <title>Bewerbungen — {{FIRMA}}</title><style>
 *{box-sizing:border-box}
 body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
-background:#f6f5f2;color:#1c1c1a;line-height:1.6}
+background:#f2f5fa;color:#1a1d24;line-height:1.6}
 .huelle{max-width:680px;margin:0 auto;padding:16px}
-header{background:{{FARBE}};color:#fff;border-radius:16px;padding:20px 22px;
-display:flex;align-items:center;gap:14px}
-header img{height:42px;width:auto;border-radius:8px;background:#fff;padding:4px}
-header h1{margin:0;font-size:19px;font-weight:600;letter-spacing:-.01em}
-header p{margin:1px 0 0;font-size:13px;opacity:.82}
-.zone{margin-top:16px;background:#fff;border:2px dashed #cfccc4;border-radius:16px;
-padding:38px 20px;text-align:center;transition:.15s}
-.zone.aktiv{border-color:{{FARBE}};background:{{FARBE_HELL}}}
-.zone .sym{font-size:38px;line-height:1}
-.zone h2{margin:10px 0 2px;font-size:16px;font-weight:600}
-.zone p{margin:0;color:#77746c;font-size:13px}
+header{background:linear-gradient(135deg,{{FARBE}} 0%,{{FARBE_DUNKEL}} 100%);
+color:#fff;border-radius:18px;padding:22px 24px;display:flex;align-items:center;gap:15px;
+box-shadow:0 6px 22px rgba(27,58,140,.22);position:relative;overflow:hidden}
+header:after{content:"";position:absolute;left:0;right:0;bottom:0;height:4px;
+background:linear-gradient(90deg,{{AKZENT}} 0%,{{AKZENT}} 38%,transparent 38%)}
+header img{height:46px;width:auto;border-radius:10px;background:#fff;padding:5px}
+header .kuerzel{height:46px;width:46px;flex:0 0 46px;border-radius:12px;
+background:rgba(255,255,255,.17);display:flex;align-items:center;justify-content:center;
+font-size:17px;font-weight:700;letter-spacing:.5px}
+header h1{margin:0;font-size:20px;font-weight:600;letter-spacing:-.015em}
+header p{margin:2px 0 0;font-size:13px;opacity:.8}
+.zone{margin-top:18px;background:#fff;border:2px dashed #c6d0e4;border-radius:18px;
+padding:42px 20px;text-align:center;transition:.18s ease;
+box-shadow:0 2px 10px rgba(27,58,140,.06)}
+.zone.aktiv{border-color:{{FARBE}};background:{{FARBE_HELL}};transform:scale(1.012)}
+.zone .sym{width:58px;height:58px;margin:0 auto;border-radius:16px;
+background:{{FARBE_HELL}};display:flex;align-items:center;justify-content:center;
+font-size:27px;line-height:1}
+.zone h2{margin:13px 0 3px;font-size:16px;font-weight:600}
+.zone p{margin:0;color:#6d7480;font-size:13px}
+.marken{display:flex;gap:6px;justify-content:center;margin-top:11px;flex-wrap:wrap}
+.marken span{font-size:11px;font-weight:600;letter-spacing:.4px;color:{{FARBE}};
+background:{{FARBE_HELL}};border-radius:6px;padding:3px 9px}
 button{margin-top:16px;background:{{FARBE}};color:#fff;border:0;border-radius:10px;
 padding:13px 22px;font-size:15px;font-weight:600;cursor:pointer;width:100%;max-width:280px;
 font-family:inherit}
 button:active{opacity:.85}
 button.leer{background:#fff;color:{{FARBE}};border:1.5px solid {{FARBE}}}
 button:disabled{opacity:.5}
-.trenner{display:flex;align-items:center;gap:10px;margin:18px 0;color:#a6a29a;font-size:12px}
-.trenner:before,.trenner:after{content:"";flex:1;height:1px;background:#dedbd3}
-.karte{background:#fff;border:1px solid #e6e3dd;border-radius:16px;padding:18px 20px;margin-top:16px}
+.trenner{display:flex;align-items:center;gap:10px;margin:18px 0;color:#9aa2b1;font-size:12px}
+.trenner:before,.trenner:after{content:"";flex:1;height:1px;background:#dbe1ee}
+.karte{background:#fff;border:1px solid #e3e8f2;border-radius:18px;padding:20px 22px;
+margin-top:16px;box-shadow:0 2px 10px rgba(27,58,140,.06)}
 .karte.aus{display:none}
-input,textarea{width:100%;padding:11px 13px;border:1px solid #dedbd3;border-radius:10px;
+input,textarea{width:100%;padding:11px 13px;border:1px solid #d5dced;border-radius:10px;
 font-size:15px;font-family:inherit;margin-bottom:10px;background:#fff}
 textarea{min-height:150px;resize:vertical}
 .oben{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
@@ -437,35 +545,36 @@ textarea{min-height:150px;resize:vertical}
 .pill{display:inline-block;font-size:12px;font-weight:600;padding:3px 11px;
 border-radius:20px;margin-top:7px}
 .note{font-size:34px;font-weight:600;line-height:1;text-align:right}
-.note span{font-size:15px;color:#a6a29a;font-weight:400}
-.note small{display:block;font-size:12px;color:#77746c;font-weight:400;margin-bottom:2px}
-hr{border:0;border-top:1px solid #eceae4;margin:15px 0}
+.note span{font-size:15px;color:#9aa2b1;font-weight:400}
+.note small{display:block;font-size:12px;color:#6d7480;font-weight:400;margin-bottom:2px}
+hr{border:0;border-top:1px solid #e8ecf5;margin:15px 0}
 .zeile{margin-bottom:11px}
 .lab{display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px}
-.lab span{color:#77746c}
-.lab em{font-style:normal;color:#b2aea6;font-size:11px;margin-left:5px}
+.lab span{color:#6d7480}
+.lab em{font-style:normal;color:#a8b0bf;font-size:11px;margin-left:5px}
 .lab b{font-weight:600}
-.spur{height:8px;background:#f0eee8;border-radius:5px;overflow:hidden}
+.spur{height:8px;background:#eaeef6;border-radius:5px;overflow:hidden}
 .spur i{display:block;height:100%;width:0;border-radius:5px;transition:width .45s ease}
-.fazit{font-size:14px;color:#55524c;margin:0}
-.fuss{font-size:13px;color:#77746c;margin:6px 0 0}
-.lade{text-align:center;color:#77746c;font-size:14px;padding:14px 0}
-.fehler{background:#fdecea;color:#a3231f;border-radius:10px;padding:11px 14px;
+.fazit{font-size:14px;color:#4c515c;margin:0}
+.fuss{font-size:13px;color:#6d7480;margin:6px 0 0}
+.lade{text-align:center;color:#6d7480;font-size:14px;padding:14px 0}
+.fehler{background:#fdeceb;color:{{AKZENT}};border-radius:10px;padding:11px 14px;
 font-size:14px;margin-top:12px}
-.hinweis{text-align:center;color:#a6a29a;font-size:12px;margin:22px 0 34px;line-height:1.5}
+.hinweis{text-align:center;color:#9aa2b1;font-size:12px;margin:22px 0 34px;line-height:1.5}
 </style></head><body><div class="huelle">
 
 <header>
-<img src="/static/logo.png" alt="" onerror="this.remove()">
+<img src="/static/logo.png" alt="" onerror="this.outerHTML='<div class=\\'kuerzel\\'>{{KUERZEL}}</div>'">
 <div><h1>{{FIRMA}}</h1><p>Bewerbungen sichten</p></div>
 </header>
 
 <div class="zone" id="zone">
 <div class="sym">📄</div>
 <h2>Datei hier ablegen</h2>
-<p>E-Mail im Format .eml</p>
+<p>oder unten auswählen</p>
+<div class="marken"><span>EML</span><span>PDF</span><span>TXT</span></div>
 <button onclick="datei.click()">Datei auswählen</button>
-<input type="file" id="datei" accept=".eml" hidden>
+<input type="file" id="datei" accept=".eml,.pdf,.txt,.md,.rtf" hidden>
 </div>
 
 <div class="trenner">oder</div>

@@ -3,3 +3,4 @@ uvicorn[standard]
 openpyxl
 python-multipart
 anthropic
+pypdf

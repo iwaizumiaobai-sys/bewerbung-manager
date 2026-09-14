@@ -501,91 +501,145 @@ SEITE = """<!doctype html><html lang="de"><head><meta charset="utf-8">
 <title>Bewerbungen — {{FIRMA}}</title><style>
 *{box-sizing:border-box}
 body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
-background:#f2f5fa;color:#1a1d24;line-height:1.6}
-.huelle{max-width:680px;margin:0 auto;padding:16px}
-header{background:linear-gradient(135deg,{{FARBE}} 0%,{{FARBE_DUNKEL}} 100%);
-color:#fff;border-radius:18px;padding:22px 24px;display:flex;align-items:center;gap:15px;
-box-shadow:0 6px 22px rgba(27,58,140,.22);position:relative;overflow:hidden}
-header:after{content:"";position:absolute;left:0;right:0;bottom:0;height:4px;
-background:linear-gradient(90deg,{{AKZENT}} 0%,{{AKZENT}} 38%,transparent 38%)}
-header img{height:46px;width:auto;border-radius:10px;background:#fff;padding:5px}
-header .kuerzel{height:46px;width:46px;flex:0 0 46px;border-radius:12px;
-background:rgba(255,255,255,.17);display:flex;align-items:center;justify-content:center;
-font-size:17px;font-weight:700;letter-spacing:.5px}
-header h1{margin:0;font-size:20px;font-weight:600;letter-spacing:-.015em}
-header p{margin:2px 0 0;font-size:13px;opacity:.8}
-.zone{margin-top:18px;background:#fff;border:2px dashed #c6d0e4;border-radius:18px;
-padding:42px 20px;text-align:center;transition:.18s ease;
-box-shadow:0 2px 10px rgba(27,58,140,.06)}
-.zone.aktiv{border-color:{{FARBE}};background:{{FARBE_HELL}};transform:scale(1.012)}
-.zone .sym{width:58px;height:58px;margin:0 auto;border-radius:16px;
-background:{{FARBE_HELL}};display:flex;align-items:center;justify-content:center;
-font-size:27px;line-height:1}
-.zone h2{margin:13px 0 3px;font-size:16px;font-weight:600}
-.zone p{margin:0;color:#6d7480;font-size:13px}
-.marken{display:flex;gap:6px;justify-content:center;margin-top:11px;flex-wrap:wrap}
-.marken span{font-size:11px;font-weight:600;letter-spacing:.4px;color:{{FARBE}};
-background:{{FARBE_HELL}};border-radius:6px;padding:3px 9px}
-button{margin-top:16px;background:{{FARBE}};color:#fff;border:0;border-radius:10px;
-padding:13px 22px;font-size:15px;font-weight:600;cursor:pointer;width:100%;max-width:280px;
-font-family:inherit}
-button:active{opacity:.85}
-button.leer{background:#fff;color:{{FARBE}};border:1.5px solid {{FARBE}}}
-button:disabled{opacity:.5}
-.trenner{display:flex;align-items:center;gap:10px;margin:18px 0;color:#9aa2b1;font-size:12px}
-.trenner:before,.trenner:after{content:"";flex:1;height:1px;background:#dbe1ee}
-.karte{background:#fff;border:1px solid #e3e8f2;border-radius:18px;padding:20px 22px;
-margin-top:16px;box-shadow:0 2px 10px rgba(27,58,140,.06)}
+color:#152238;line-height:1.6;min-height:100vh;
+background:
+radial-gradient(900px 520px at 88% 96%,rgba(120,170,235,.20),transparent 62%),
+radial-gradient(700px 420px at 4% 4%,rgba(150,195,245,.16),transparent 60%),
+linear-gradient(170deg,#f4f8fe 0%,#e9f1fc 100%)}
+.huelle{max-width:720px;margin:0 auto;padding:18px 16px 40px}
+
+/* Kopfzeile mit Logo */
+.marke{display:flex;align-items:center;gap:12px;padding:4px 2px 0}
+.marke img{height:46px;width:auto}
+.marke .kuerzel{height:46px;width:46px;flex:0 0 46px;border-radius:50%;
+background:linear-gradient(140deg,{{FARBE}},{{FARBE_DUNKEL}});color:#fff;
+display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:700}
+.marke h1{margin:0;font-size:21px;font-weight:700;letter-spacing:-.02em;color:#12224a}
+.marke h1 i{font-style:normal;color:{{AKZENT}}}
+.marke p{margin:0;font-size:11px;letter-spacing:.13em;text-transform:uppercase;
+color:#8fa2c2;font-weight:500}
+
+/* Blaues Band */
+.band{margin-top:18px;border-radius:18px;padding:22px 24px;color:#fff;position:relative;
+overflow:hidden;display:flex;align-items:center;gap:16px;
+background:linear-gradient(115deg,{{FARBE_DUNKEL}} 0%,{{FARBE}} 58%,#2a5fd0 100%);
+box-shadow:0 10px 30px rgba(20,50,120,.26)}
+.band:before{content:"";position:absolute;right:-90px;top:-70px;width:280px;height:280px;
+border-radius:50%;background:radial-gradient(circle at 34% 34%,
+rgba(120,190,255,.55),rgba(60,120,220,.20) 52%,transparent 72%)}
+.band .ikon{width:52px;height:52px;flex:0 0 52px;border-radius:14px;
+background:rgba(255,255,255,.16);display:flex;align-items:center;justify-content:center;
+font-size:24px;position:relative;z-index:1}
+.band .txt{position:relative;z-index:1;min-width:0}
+.band h2{margin:0;font-size:19px;font-weight:700;letter-spacing:-.015em}
+.band p{margin:2px 0 0;font-size:13.5px;opacity:.86}
+.band .strich{position:relative;z-index:1;margin-top:12px;height:4px;width:min(300px,60%);
+border-radius:3px;background:rgba(255,255,255,.22);overflow:hidden}
+.band .strich i{display:block;height:100%;width:62%;border-radius:3px;
+background:linear-gradient(90deg,#7fc0ff,#d8ecff)}
+
+/* Ablageflaeche */
+.zone{margin-top:16px;background:#fff;border-radius:20px;padding:12px;
+box-shadow:0 6px 26px rgba(30,70,150,.10);transition:.18s ease}
+.zone .innen{border:2px dashed #b9cdea;border-radius:15px;padding:36px 18px;
+text-align:center;transition:.18s ease}
+.zone.aktiv{transform:scale(1.012)}
+.zone.aktiv .innen{border-color:{{FARBE}};background:{{FARBE_HELL}}}
+.zone .sym{width:66px;height:66px;margin:0 auto;border-radius:50%;
+background:radial-gradient(circle at 50% 38%,#fff,{{FARBE_HELL}});
+border:1px solid #dbe7f8;display:flex;align-items:center;justify-content:center;
+font-size:28px;box-shadow:0 3px 14px rgba(40,90,180,.13)}
+.zone h3{margin:14px 0 2px;font-size:21px;font-weight:700;letter-spacing:-.02em;color:#12224a}
+.zone .unter{margin:0;color:#7e8ca6;font-size:14px}
+.marken{display:flex;gap:8px;justify-content:center;margin-top:13px;flex-wrap:wrap}
+.marken span{font-size:12px;font-weight:700;letter-spacing:.5px;color:{{FARBE}};
+background:{{FARBE_HELL}};border:1px solid #dbe7f8;border-radius:9px;padding:5px 15px}
+
+/* Knoepfe */
+button{font-family:inherit;cursor:pointer;border:0;font-weight:600}
+.haupt{margin-top:18px;background:linear-gradient(100deg,{{FARBE}},#2f6ae0);
+color:#fff;border-radius:13px;padding:15px 26px;font-size:15.5px;width:100%;max-width:330px;
+display:inline-flex;align-items:center;justify-content:center;gap:10px;
+box-shadow:0 7px 20px rgba(30,80,190,.30);transition:.15s}
+.haupt:active{transform:translateY(1px);box-shadow:0 4px 12px rgba(30,80,190,.28)}
+.haupt .pfeil{font-size:18px;line-height:1}
+.zweit{width:100%;background:#fff;color:{{FARBE}};border:1.6px solid {{FARBE}};
+border-radius:13px;padding:14px 20px;font-size:15px;
+display:inline-flex;align-items:center;justify-content:center;gap:10px}
+.zweit:active{background:{{FARBE_HELL}}}
+
+.trenner{display:flex;align-items:center;gap:12px;margin:22px 0 14px;
+color:#8fa2c2;font-size:13px;font-weight:600}
+.trenner:before,.trenner:after{content:"";flex:1;height:1px;background:#d6e2f3}
+
+/* Karten */
+.karte{background:#fff;border-radius:20px;padding:20px 22px;margin-top:16px;
+box-shadow:0 6px 26px rgba(30,70,150,.10)}
 .karte.aus{display:none}
-input,textarea{width:100%;padding:11px 13px;border:1px solid #d5dced;border-radius:10px;
-font-size:15px;font-family:inherit;margin-bottom:10px;background:#fff}
+input,textarea{width:100%;padding:12px 14px;border:1px solid #d5e0f2;border-radius:11px;
+font-size:15px;font-family:inherit;margin-bottom:10px;background:#fbfcff;color:#152238}
+input:focus,textarea:focus{outline:0;border-color:{{FARBE}};background:#fff}
 textarea{min-height:150px;resize:vertical}
+
 .oben{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
-.nam{font-size:17px;font-weight:600;margin:0}
-.pill{display:inline-block;font-size:12px;font-weight:600;padding:3px 11px;
+.nam{font-size:18px;font-weight:700;margin:0;letter-spacing:-.01em;color:#12224a}
+.pill{display:inline-block;font-size:12px;font-weight:700;padding:4px 12px;
 border-radius:20px;margin-top:7px}
-.note{font-size:34px;font-weight:600;line-height:1;text-align:right}
-.note span{font-size:15px;color:#9aa2b1;font-weight:400}
-.note small{display:block;font-size:12px;color:#6d7480;font-weight:400;margin-bottom:2px}
-hr{border:0;border-top:1px solid #e8ecf5;margin:15px 0}
-.zeile{margin-bottom:11px}
-.lab{display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px}
-.lab span{color:#6d7480}
-.lab em{font-style:normal;color:#a8b0bf;font-size:11px;margin-left:5px}
-.lab b{font-weight:600}
-.spur{height:8px;background:#eaeef6;border-radius:5px;overflow:hidden}
+.note{font-size:36px;font-weight:700;line-height:1;text-align:right;color:#12224a}
+.note span{font-size:15px;color:#9aa9c2;font-weight:500}
+.note small{display:block;font-size:12px;color:#7e8ca6;font-weight:500;margin-bottom:2px}
+hr{border:0;border-top:1px solid #e7eefa;margin:16px 0}
+.zeile{margin-bottom:12px}
+.lab{display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px}
+.lab span{color:#7e8ca6}
+.lab em{font-style:normal;color:#a7b5cc;font-size:11px;margin-left:5px}
+.lab b{font-weight:700;color:#12224a}
+.spur{height:9px;background:#eef3fb;border-radius:5px;overflow:hidden}
 .spur i{display:block;height:100%;width:0;border-radius:5px;transition:width .45s ease}
-.fazit{font-size:14px;color:#4c515c;margin:0}
-.fuss{font-size:13px;color:#6d7480;margin:6px 0 0}
-.lade{text-align:center;color:#6d7480;font-size:14px;padding:14px 0}
-.fehler{background:#fdeceb;color:{{AKZENT}};border-radius:10px;padding:11px 14px;
-font-size:14px;margin-top:12px}
-.hinweis{text-align:center;color:#9aa2b1;font-size:12px;margin:22px 0 34px;line-height:1.5}
+.fazit{font-size:14px;color:#48566e;margin:0}
+.fuss{font-size:13px;color:#7e8ca6;margin:6px 0 0}
+
+.lade{text-align:center;color:{{FARBE}};font-size:14px;font-weight:600;padding:16px 0}
+.fehler{background:#fdecea;color:{{AKZENT}};border-radius:12px;padding:12px 15px;
+font-size:14px;margin-top:12px;font-weight:500}
+
+.sicher{display:flex;align-items:center;justify-content:center;gap:9px;margin:26px 0 0}
+.sicher .schild{font-size:19px}
+.sicher p{margin:0;font-size:13px;color:#5b6b86}
+.sicher p b{color:#12224a}
+.sicher p small{display:block;font-size:11.5px;color:#93a3bf}
 </style></head><body><div class="huelle">
 
-<header>
+<div class="marke">
 <img src="/static/logo.png" alt="" onerror="this.outerHTML='<div class=\\'kuerzel\\'>{{KUERZEL}}</div>'">
-<div><h1>{{FIRMA}}</h1><p>Bewerbungen sichten</p></div>
-</header>
-
-<div class="zone" id="zone">
-<div class="sym">📄</div>
-<h2>Datei hier ablegen</h2>
-<p>oder unten auswählen</p>
-<div class="marken"><span>EML</span><span>PDF</span><span>TXT</span></div>
-<button onclick="datei.click()">Datei auswählen</button>
-<input type="file" id="datei" accept=".eml,.pdf,.txt,.md,.rtf" hidden>
+<div><h1>Places <i>to</i> Be</h1><p>Bewerbungen sichten</p></div>
 </div>
 
+<div class="band">
+<div class="ikon">📄</div>
+<div class="txt"><h2>Bewerbungen verarbeiten</h2>
+<p>Unterlagen hochladen und bewerten lassen.</p>
+<div class="strich"><i></i></div></div>
+</div>
+
+<div class="zone" id="zone"><div class="innen">
+<div class="sym">☁️</div>
+<h3>Datei hier ablegen</h3>
+<p class="unter">oder unten auswählen</p>
+<div class="marken"><span>EML</span><span>PDF</span><span>TXT</span></div>
+<button class="haupt" onclick="datei.click()">Datei auswählen <span class="pfeil">→</span></button>
+<input type="file" id="datei" accept=".eml,.pdf,.txt,.md,.rtf" hidden>
+</div></div>
+
 <div class="trenner">oder</div>
-<button class="leer" onclick="handForm()">Text von Hand eingeben</button>
+<button class="zweit" onclick="handForm()">⌨️ Text von Hand eingeben</button>
 
 <div class="karte aus" id="hand">
 <input id="h-name" placeholder="Name">
 <input id="h-mail" placeholder="E-Mail-Adresse">
 <input id="h-betreff" placeholder="Betreff">
 <textarea id="h-text" placeholder="Bewerbungstext einfügen"></textarea>
-<button onclick="sendeText()">Bewerten</button>
+<button class="haupt" style="max-width:none" onclick="sendeText()">Bewerten <span class="pfeil">→</span></button>
 </div>
 
 <div class="lade" id="lade" style="display:none">Wird ausgewertet …</div>
@@ -601,14 +655,15 @@ font-size:14px;margin-top:12px}
 <hr>
 <p class="fazit" id="r-fazit">–</p>
 <p class="fuss" id="r-fs">–</p>
-<button onclick="location.href='/api/excel'" style="margin-top:16px;max-width:none">
-Excel herunterladen</button>
-<button class="leer" onclick="zuruecksetzen()" style="margin-top:8px;max-width:none">
+<button class="haupt" style="max-width:none" onclick="location.href='/api/excel'">
+⬇ Excel herunterladen</button>
+<button class="zweit" style="margin-top:9px" onclick="zuruecksetzen()">
 Nächste Bewerbung</button>
 </div>
 
-<p class="hinweis">Die Entscheidung trifft das Team.<br>
-Bewerbungen werden nach {{TAGE}} Tagen automatisch gelöscht.</p>
+<div class="sicher"><span class="schild">🛡️</span>
+<p><b>Die Entscheidung trifft das Team.</b>
+<small>Bewerbungen werden nach {{TAGE}} Tagen automatisch gelöscht.</small></p></div>
 </div>
 
 <script>

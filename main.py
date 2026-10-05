@@ -5,17 +5,19 @@ Auf Railway:  laeuft ueber das Procfile automatisch.
 """
 
 import email
+import hashlib
 import io
 import json
 import os
 import re
+import secrets
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from email.header import decode_header
 
-from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -45,14 +47,74 @@ DB = os.environ.get("DB_PATH", "/tmp/bewerbungen.db")
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 MODELL = os.environ.get("AI_MODEL", "claude-sonnet-4-6")
 
-KRITERIEN = [
-    ("resilienz", "Umgang mit Ablehnung", 25),
-    ("reise", "Reisebereitschaft", 20),
-    ("extro", "Extrovertiertheit", 20),
-    ("erfahrung", "Vorerfahrung", 15),
-    ("motivation", "Motivation", 15),
-    ("sprache", "Sprachkenntnisse", 5),
+# --- Schutz gegen Missbrauch und ausufernde Kosten ---
+PASSWORT = os.environ.get("PASSWORT", "")
+TAGESLIMIT = int(os.environ.get("TAGESLIMIT", "150"))   # Bewertungen pro Tag
+MAX_MB = float(os.environ.get("MAX_MB", "8"))           # groesste erlaubte Datei
+
+# Wert, den der Zutritts-Cookie tragen muss. Aendert sich mit dem Passwort.
+MARKE = hashlib.sha256(("ptb-zutritt-" + PASSWORT).encode()).hexdigest()[:40]
+
+# Bewertungskriterien: Schluessel, Anzeigename, Gewicht, Erklaerung fuer die KI.
+# Ueber die Variable KRITERIEN aenderbar, eine Zeile je Kriterium:
+#   kuerzel|Anzeigename|Gewicht|Was gemeint ist
+# Bei leerer oder fehlerhafter Variable gilt diese Vorgabe.
+KRITERIEN_VORGABE = [
+    ("resilienz", "Umgang mit Ablehnung", 25,
+     "Frustrationstoleranz, Umgang mit Absagen und Gegenwind"),
+    ("reise", "Reisebereitschaft", 20,
+     "zeitliche und raeumliche Flexibilitaet, Bereitschaft zu reisen"),
+    ("extro", "Extrovertiertheit", 20,
+     "Offenheit, Kommunikationsfreude, Zugehen auf Fremde"),
+    ("erfahrung", "Vorerfahrung", 15,
+     "Vertrieb, Promotion, Standarbeit, Kundenkontakt"),
+    ("motivation", "Motivation", 15,
+     "Warum gerade Fundraising, Bezug zu gemeinnuetziger Arbeit"),
+    ("sprache", "Sprachkenntnisse", 5,
+     "Ausdruck und erwaehnte Sprachkenntnisse"),
 ]
+
+
+def kriterien_lesen():
+    """Liest die Kriterien aus der Variable. Faellt auf die Vorgabe zurueck."""
+    roh = os.environ.get("KRITERIEN", "").strip()
+    if not roh:
+        return KRITERIEN_VORGABE
+
+    gelesen = []
+    for zeile in roh.splitlines():
+        zeile = zeile.strip()
+        if not zeile or zeile.startswith("#"):
+            continue
+        teile = [t.strip() for t in zeile.split("|")]
+        if len(teile) < 3:
+            continue
+        schluessel = re.sub(r"[^a-z0-9_]", "", teile[0].lower())
+        if not schluessel:
+            continue
+        try:
+            gewicht = max(1, min(100, int(float(teile[2]))))
+        except ValueError:
+            continue
+        titel = teile[1] or schluessel
+        erklaerung = teile[3] if len(teile) > 3 else titel
+        gelesen.append((schluessel, titel, gewicht, erklaerung))
+
+    # Doppelte Schluessel entfernen, Reihenfolge behalten
+    gesehen, sauber = set(), []
+    for eintrag in gelesen:
+        if eintrag[0] in gesehen:
+            continue
+        gesehen.add(eintrag[0])
+        sauber.append(eintrag)
+
+    if len(sauber) < 2:
+        return KRITERIEN_VORGABE
+    return sauber[:10]
+
+
+KRITERIEN = kriterien_lesen()
+GEWICHT_SUMME = sum(g for _, _, g, _ in KRITERIEN) or 1
 
 STATUS_FARBEN = {
     "gruen": ("C6EFCE", "Einladen"),
@@ -81,6 +143,45 @@ def init():
                 angelegt TEXT
             )
         """)
+        # Nachtraeglich ergaenzte Spalten: still uebergehen, wenn sie schon da sind.
+        for spalte in ("verfuegbarkeit TEXT",):
+            try:
+                c.execute(f"ALTER TABLE bewerbungen ADD COLUMN {spalte}")
+            except sqlite3.OperationalError:
+                pass
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS tageszaehler (
+                tag TEXT PRIMARY KEY,
+                anzahl INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+
+
+def heute():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def verbrauch_heute():
+    """Wie viele Bewertungen heute schon liefen."""
+    with conn() as c:
+        reihe = c.execute("SELECT anzahl FROM tageszaehler WHERE tag=?",
+                          (heute(),)).fetchone()
+    return reihe["anzahl"] if reihe else 0
+
+
+def kontingent_buchen():
+    """Bucht eine Bewertung. Gibt False zurueck, wenn das Tageslimit erreicht ist.
+
+    Zaehlt auch dann hoch, wenn die Bewerbung spaeter geloescht wird, denn der
+    API-Aufruf hat bereits Geld gekostet.
+    """
+    with conn() as c:
+        c.execute("INSERT OR IGNORE INTO tageszaehler (tag, anzahl) VALUES (?, 0)",
+                  (heute(),))
+        zeiger = c.execute(
+            "UPDATE tageszaehler SET anzahl = anzahl + 1 "
+            "WHERE tag = ? AND anzahl < ?", (heute(), TAGESLIMIT))
+        return zeiger.rowcount > 0
 
 
 def aufraeumen():
@@ -212,36 +313,93 @@ def name_raten(text, dateiname=""):
     return " ".join(w.capitalize() for w in woerter) or "Unbekannt"
 
 
-PROMPT = """Du hilfst einer Fundraising-Agentur bei der Vorsortierung von Bewerbungen
-fuer die Taetigkeit als Werber an Infostaenden (Mitgliederwerbung fuer gemeinnuetzige
-Organisationen).
+ROLLE = os.environ.get(
+    "ROLLE",
+    "Du hilfst einer Fundraising-Agentur bei der Vorsortierung von Bewerbungen\n"
+    "fuer die Taetigkeit als Werber an Infostaenden (Mitgliederwerbung fuer\n"
+    "gemeinnuetzige Organisationen)."
+)
 
-Bewerte den folgenden Bewerbungstext auf einer Skala von 1 bis 10 je Kriterium:
 
-- resilienz: Umgang mit Ablehnung, Frustrationstoleranz
-- reise: Reisebereitschaft, zeitliche und raeumliche Flexibilitaet
-- extro: Offenheit, Kommunikationsfreude, Zugehen auf Fremde
-- erfahrung: Vertrieb, Promotion, Standarbeit, Kundenkontakt
-- motivation: Warum gerade Fundraising, Bezug zu gemeinnuetziger Arbeit
-- sprache: Ausdruck und erwaehnte Sprachkenntnisse
+def prompt_bauen():
+    """Baut die Anweisung an die KI aus den aktuellen Kriterien."""
+    punkte = "\n".join(f"- {k}: {erklaerung}" for k, _, _, erklaerung in KRITERIEN)
+    felder = ", ".join(f'"{k}": 0' for k, _, _, _ in KRITERIEN)
+    return (
+        ROLLE + "\n\n"
+        "Bewerte den folgenden Bewerbungstext auf einer Skala von 1 bis 10\n"
+        "je Kriterium:\n\n"
+        + punkte + "\n\n"
+        "Wenn zu einem Kriterium nichts im Text steht, gib 3 und erwaehne die Luecke.\n\n"
+        "Erfasse ausserdem die Verfuegbarkeit. Das wird nicht benotet, sondern als\n"
+        "Fakten gesammelt. Nimm nur, was wirklich im Text steht, und erfinde nichts.\n"
+        "Steht etwas nicht drin, schreibe genau \"unbekannt\".\n\n"
+        "- ab: ab wann die Person kann, z.B. \"sofort\", \"ab 15.10.\"\n"
+        "- dauer: fuer welchen Zeitraum, z.B. \"3 Monate\", \"unbefristet\"\n"
+        "- umfang: \"Vollzeit\", \"Teilzeit\", \"Minijob\", \"Wochenenden\" oder \"unbekannt\"\n"
+        "- hinweis: eine kurze Einschraenkung in hoechstens 6 Woertern. Sonst \"unbekannt\".\n\n"
+        "Antworte ausschliesslich mit JSON, ohne Vorrede und ohne Codebloecke:\n"
+        "{" + felder + ', "fuehrerschein": "ja|nein|unbekannt", '
+        '"verfuegbarkeit": {"ab": "", "dauer": "", "umfang": "", "hinweis": ""}, '
+        '"zusammenfassung": "ein bis zwei Saetze"}\n\n'
+        "Betreff: {betreff}\n\nText:\n{text}"
+    )
 
-Wenn zu einem Kriterium nichts im Text steht, gib 3 und erwaehne die Luecke.
 
-Antworte ausschliesslich mit JSON, ohne Vorrede und ohne Codebloecke:
-{{"resilienz": 0, "reise": 0, "extro": 0, "erfahrung": 0, "motivation": 0,
-"sprache": 0, "fuehrerschein": "ja|nein|unbekannt",
-"zusammenfassung": "ein bis zwei Saetze"}}
+PROMPT = prompt_bauen()
 
-Betreff: {betreff}
 
-Text:
-{text}"""
+VERFUEG_FELDER = [
+    ("ab", "Ab wann"),
+    ("dauer", "Dauer"),
+    ("umfang", "Umfang"),
+    ("hinweis", "Hinweis"),
+]
+
+
+def leere_verfuegbarkeit():
+    """Alle Verfuegbarkeitsfelder auf unbekannt."""
+    return {schluessel: "unbekannt" for schluessel, _ in VERFUEG_FELDER}
+
+
+def verfuegbarkeit_der_reihe(reihe):
+    """Liest die gespeicherte Verfuegbarkeit, auch bei alten Eintraegen ohne sie."""
+    try:
+        roh = reihe["verfuegbarkeit"]
+    except (IndexError, KeyError):
+        return leere_verfuegbarkeit()
+    if not roh:
+        return leere_verfuegbarkeit()
+    try:
+        geladen = json.loads(roh)
+    except (ValueError, TypeError):
+        return leere_verfuegbarkeit()
+    grund = leere_verfuegbarkeit()
+    if isinstance(geladen, dict):
+        for schluessel, _ in VERFUEG_FELDER:
+            wert = str(geladen.get(schluessel, "")).strip()
+            if wert:
+                grund[schluessel] = wert
+    return grund
+
+
+def verfuegbarkeit_aus(daten):
+    """Holt die Verfuegbarkeit aus der KI-Antwort und raeumt sie auf."""
+    roh = daten.get("verfuegbarkeit")
+    if not isinstance(roh, dict):
+        return leere_verfuegbarkeit()
+    sauber = {}
+    for schluessel, _ in VERFUEG_FELDER:
+        wert = str(roh.get(schluessel, "")).strip()[:60]
+        sauber[schluessel] = wert or "unbekannt"
+    return sauber
 
 
 def bewerten(betreff, text):
     if not API_KEY:
-        return {k: 5 for k, _, _ in KRITERIEN} | {
+        return {k: 5 for k, _, _, _ in KRITERIEN} | {
             "fuehrerschein": "unbekannt",
+            "verfuegbarkeit": leere_verfuegbarkeit(),
             "zusammenfassung": "Keine KI-Bewertung aktiv (ANTHROPIC_API_KEY fehlt).",
         }
     try:
@@ -250,7 +408,7 @@ def bewerten(betreff, text):
         klient = anthropic.Anthropic(api_key=API_KEY)
         antwort = klient.messages.create(
             model=MODELL,
-            max_tokens=700,
+            max_tokens=900,
             messages=[{"role": "user",
                        "content": PROMPT.format(betreff=betreff, text=text[:12000])}],
         )
@@ -258,29 +416,31 @@ def bewerten(betreff, text):
         roh = re.sub(r"```(?:json)?|```", "", roh).strip()
         daten = json.loads(roh)
     except Exception as fehler:
-        return {k: 3 for k, _, _ in KRITERIEN} | {
+        return {k: 3 for k, _, _, _ in KRITERIEN} | {
             "fuehrerschein": "unbekannt",
+            "verfuegbarkeit": leere_verfuegbarkeit(),
             "zusammenfassung": f"Bewertung fehlgeschlagen: {fehler}",
         }
 
     ergebnis = {}
-    for schluessel, _, _ in KRITERIEN:
+    for schluessel, _, _, _ in KRITERIEN:
         try:
             ergebnis[schluessel] = max(1, min(10, int(round(float(daten.get(schluessel, 3))))))
         except Exception:
             ergebnis[schluessel] = 3
     ergebnis["fuehrerschein"] = str(daten.get("fuehrerschein", "unbekannt"))[:20]
+    ergebnis["verfuegbarkeit"] = verfuegbarkeit_aus(daten)
     ergebnis["zusammenfassung"] = str(daten.get("zusammenfassung", ""))[:500]
     return ergebnis
 
 
 def gesamtnote(scores):
-    summe = sum(scores[k] * g for k, _, g in KRITERIEN)
-    return round(summe / 100, 1)
+    summe = sum(scores[k] * g for k, _, g, _ in KRITERIEN)
+    return round(summe / GEWICHT_SUMME, 1)
 
 
 def status_aus(note, scores):
-    fehlend = sum(1 for k, _, _ in KRITERIEN if scores[k] == 3)
+    fehlend = sum(1 for k, _, _, _ in KRITERIEN if scores[k] == 3)
     if fehlend >= 3:
         return "grau"
     if note >= 7.5:
@@ -290,27 +450,39 @@ def status_aus(note, scores):
     return "rot"
 
 
+class LimitErreicht(Exception):
+    """Das Tageskontingent ist aufgebraucht."""
+
+
 def verarbeiten(daten):
+    if API_KEY and not kontingent_buchen():
+        raise LimitErreicht(
+            f"Tageslimit von {TAGESLIMIT} Bewertungen erreicht. "
+            "Morgen geht es weiter, oder das Limit bei Railway hochsetzen.")
     scores = bewerten(daten["betreff"], daten["text"])
     note = gesamtnote(scores)
     status = status_aus(note, scores)
-    nur_scores = {k: scores[k] for k, _, _ in KRITERIEN}
+    nur_scores = {k: scores[k] for k, _, _, _ in KRITERIEN}
+
+    verfuegbar = scores.get("verfuegbarkeit") or leere_verfuegbarkeit()
 
     with conn() as c:
         zeiger = c.execute(
             """INSERT INTO bewerbungen
                (name, absender, betreff, text, status, gesamt, scores,
-                zusammenfassung, fuehrerschein, angelegt)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                zusammenfassung, fuehrerschein, verfuegbarkeit, angelegt)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (daten["name"], daten["absender"], daten["betreff"], daten["text"],
              status, note, json.dumps(nur_scores), scores["zusammenfassung"],
-             scores["fuehrerschein"], datetime.now(timezone.utc).isoformat()),
+             scores["fuehrerschein"], json.dumps(verfuegbar),
+             datetime.now(timezone.utc).isoformat()),
         )
         neue_id = zeiger.lastrowid
 
     return {"id": neue_id, "name": daten["name"], "betreff": daten["betreff"],
             "status": status, "gesamt": note, "scores": nur_scores,
             "fuehrerschein": scores["fuehrerschein"],
+            "verfuegbarkeit": verfuegbar,
             "zusammenfassung": scores["zusammenfassung"]}
 
 
@@ -319,23 +491,98 @@ def verarbeiten(daten):
 app = FastAPI()
 init()
 
+# --- Zutritt ---------------------------------------------------------------
+# Ein gemeinsames Passwort fuers Team. Wer es kennt, bekommt einen Cookie.
+# Ohne gesetztes Passwort bleibt die Seite offen und warnt sichtbar davor.
+
+FEHLVERSUCHE = {}          # Adresse -> [Anzahl, Zeitpunkt des ersten Versuchs]
+SPERRE_AB = 8              # so viele Fehlversuche
+SPERRE_DAUER = 15 * 60     # dann so lange Pause, in Sekunden
+OFFEN = ("/login", "/static/logo.png")
+
+
+def gesperrt(adresse):
+    eintrag = FEHLVERSUCHE.get(adresse)
+    if not eintrag:
+        return False
+    anzahl, seit = eintrag
+    if time.time() - seit > SPERRE_DAUER:
+        FEHLVERSUCHE.pop(adresse, None)
+        return False
+    return anzahl >= SPERRE_AB
+
+
+def fehlversuch(adresse):
+    anzahl, seit = FEHLVERSUCHE.get(adresse, (0, time.time()))
+    if time.time() - seit > SPERRE_DAUER:
+        anzahl, seit = 0, time.time()
+    FEHLVERSUCHE[adresse] = (anzahl + 1, seit)
+    if len(FEHLVERSUCHE) > 500:       # Speicher nicht volllaufen lassen
+        jetzt = time.time()
+        for schluessel in [a for a, (_, t) in FEHLVERSUCHE.items()
+                           if jetzt - t > SPERRE_DAUER]:
+            FEHLVERSUCHE.pop(schluessel, None)
+
+
+@app.middleware("http")
+async def tuersteher(request: Request, call_next):
+    """Laesst nur durch, wer angemeldet ist. Gilt fuer jede Route."""
+    if not PASSWORT or request.url.path in OFFEN:
+        return await call_next(request)
+    if secrets.compare_digest(request.cookies.get("zutritt", ""), MARKE):
+        return await call_next(request)
+    if request.method == "GET" and not request.url.path.startswith("/api/"):
+        return RedirectResponse("/login", status_code=303)
+    return JSONResponse({"fehler": "Nicht angemeldet. Seite neu laden."}, 401)
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_seite(fehler: str = ""):
+    if not PASSWORT:
+        return RedirectResponse("/", status_code=303)
+    meldung = (f'<p class="warn">{fehler}</p>' if fehler else "")
+    return (LOGIN.replace("{{FARBE_DUNKEL}}", abdunkeln(FARBE))
+                 .replace("{{FARBE_HELL}}", FARBE_HELL)
+                 .replace("{{AKZENT}}", AKZENT)
+                 .replace("{{FARBE}}", FARBE)
+                 .replace("{{KUERZEL}}", kuerzel_aus(FIRMA))
+                 .replace("{{MELDUNG}}", meldung))
+
+
+@app.post("/login")
+def anmelden(request: Request, passwort: str = Form("")):
+    adresse = request.client.host if request.client else "unbekannt"
+    if gesperrt(adresse):
+        return RedirectResponse(
+            "/login?fehler=Zu+viele+Versuche.+Bitte+15+Minuten+warten.",
+            status_code=303)
+    if not secrets.compare_digest(passwort, PASSWORT):
+        fehlversuch(adresse)
+        return RedirectResponse("/login?fehler=Passwort+stimmt+nicht.",
+                                status_code=303)
+    FEHLVERSUCHE.pop(adresse, None)
+    antwort = RedirectResponse("/", status_code=303)
+    antwort.set_cookie("zutritt", MARKE, max_age=30 * 24 * 3600,
+                       httponly=True, samesite="lax", secure=True)
+    return antwort
+
 
 @app.get("/", response_class=HTMLResponse)
 def seite():
     aufraeumen()
-    balken = "".join(
-        f'<div class="zeile"><div class="lab"><span>{titel}'
-        f'<em>{gewicht}%</em></span><b id="w-{key}">–</b></div>'
-        f'<div class="spur"><i id="b-{key}"></i></div></div>'
-        for key, titel, gewicht in KRITERIEN
-    )
+    warnung = ""
+    if not PASSWORT:
+        warnung = ('<div class="warnbalken"><b>Diese Seite ist ungeschützt.</b>'
+                   'Jeder, der die Adresse kennt, kann Bewerbungen hochladen und '
+                   'damit Kosten verursachen. Bei Railway eine Variable PASSWORT '
+                   'anlegen und neu starten.</div>')
     return (SEITE.replace("{{FIRMA}}", FIRMA)
                  .replace("{{KUERZEL}}", kuerzel_aus(FIRMA))
                  .replace("{{FARBE_DUNKEL}}", abdunkeln(FARBE))
                  .replace("{{FARBE_HELL}}", FARBE_HELL)
                  .replace("{{AKZENT}}", AKZENT)
                  .replace("{{FARBE}}", FARBE)
-                 .replace("{{BALKEN}}", balken)
+                 .replace("{{WARNUNG}}", warnung)
                  .replace("{{TAGE}}", str(AUFBEWAHRUNG_TAGE)))
 
 
@@ -355,7 +602,22 @@ def logo():
 
 @app.post("/api/upload")
 async def upload(file: UploadFile = File(...)):
-    rohdaten = await file.read()
+    # Blockweise lesen und abbrechen, sobald die Grenze ueberschritten ist.
+    # So landet eine riesige Datei nie vollstaendig im Speicher.
+    grenze = int(MAX_MB * 1024 * 1024)
+    stuecke, gelesen = [], 0
+    while True:
+        stueck = await file.read(256 * 1024)
+        if not stueck:
+            break
+        gelesen += len(stueck)
+        if gelesen > grenze:
+            return JSONResponse(
+                {"fehler": f"Datei groesser als {MAX_MB:g} MB. "
+                           "Bitte kleiner speichern oder den Text einfuegen."}, 413)
+        stuecke.append(stueck)
+    rohdaten = b"".join(stuecke)
+
     dateiname = file.filename or ""
     endung = dateiname.lower().rsplit(".", 1)[-1] if "." in dateiname else ""
 
@@ -385,7 +647,10 @@ async def upload(file: UploadFile = File(...)):
 
     if not daten["text"].strip():
         return JSONResponse({"fehler": "Die Datei enthaelt keinen Text."}, 400)
-    return verarbeiten(daten)
+    try:
+        return verarbeiten(daten)
+    except LimitErreicht as grenze:
+        return JSONResponse({"fehler": str(grenze)}, 429)
 
 
 @app.post("/api/text")
@@ -393,12 +658,53 @@ async def per_hand(nutzlast: dict):
     text = (nutzlast.get("text") or "").strip()
     if not text:
         return JSONResponse({"fehler": "Kein Text angegeben."}, 400)
-    return verarbeiten({
-        "name": (nutzlast.get("name") or "Unbekannt").strip(),
-        "absender": (nutzlast.get("absender") or "").strip(),
-        "betreff": (nutzlast.get("betreff") or "Bewerbung").strip(),
-        "text": text,
-    })
+    try:
+        return verarbeiten({
+            "name": (nutzlast.get("name") or "Unbekannt").strip(),
+            "absender": (nutzlast.get("absender") or "").strip(),
+            "betreff": (nutzlast.get("betreff") or "Bewerbung").strip(),
+            "text": text,
+        })
+    except LimitErreicht as grenze:
+        return JSONResponse({"fehler": str(grenze)}, 429)
+
+
+@app.get("/api/liste")
+def liste():
+    """Alle gespeicherten Bewerbungen, beste Note zuerst."""
+    aufraeumen()
+    with conn() as c:
+        reihen = c.execute(
+            "SELECT * FROM bewerbungen ORDER BY gesamt DESC, id DESC").fetchall()
+
+    eintraege = []
+    for reihe in reihen:
+        try:
+            scores = json.loads(reihe["scores"])
+        except (ValueError, TypeError):
+            scores = {}
+        eintraege.append({
+            "id": reihe["id"],
+            "name": reihe["name"],
+            "absender": reihe["absender"],
+            "betreff": reihe["betreff"],
+            "status": reihe["status"],
+            "gesamt": reihe["gesamt"],
+            "scores": scores,
+            "verfuegbarkeit": verfuegbarkeit_der_reihe(reihe),
+            "fuehrerschein": reihe["fuehrerschein"],
+            "zusammenfassung": reihe["zusammenfassung"],
+        })
+    return {"anzahl": len(eintraege), "eintraege": eintraege,
+            "verbraucht": verbrauch_heute(), "limit": TAGESLIMIT}
+
+
+@app.post("/api/loeschen/{eintrag_id}")
+def loeschen(eintrag_id: int):
+    """Entfernt eine einzelne Bewerbung, etwa einen Fehlversuch."""
+    with conn() as c:
+        c.execute("DELETE FROM bewerbungen WHERE id=?", (eintrag_id,))
+    return {"geloescht": eintrag_id}
 
 
 @app.get("/mail/{eintrag_id}", response_class=HTMLResponse)
@@ -436,7 +742,8 @@ def excel():
     ws.title = "Bewerbungen"
 
     kopfzeile = (["Status", "Name", "Absender", "Gesamt (1-10)"]
-                 + [t for _, t, _ in KRITERIEN]
+                 + [t for _, t in VERFUEG_FELDER]
+                 + [t for _, t, _, _ in KRITERIEN]
                  + ["Fuehrerschein", "Zusammenfassung", "Einladung", "Mail"])
 
     rand = Border(*[Side(style="thin", color="BFBFBF")] * 4)
@@ -452,9 +759,11 @@ def excel():
 
     for nr, reihe in enumerate(reihen, start=2):
         scores = json.loads(reihe["scores"])
+        verfuegbar = verfuegbarkeit_der_reihe(reihe)
         farbe, beschriftung = STATUS_FARBEN.get(reihe["status"], ("FFFFFF", ""))
         werte = ([beschriftung, reihe["name"], reihe["absender"], reihe["gesamt"]]
-                 + [scores.get(k, "") for k, _, _ in KRITERIEN]
+                 + [verfuegbar.get(k, "unbekannt") for k, _ in VERFUEG_FELDER]
+                 + [scores.get(k, "") for k, _, _, _ in KRITERIEN]
                  + [reihe["fuehrerschein"], reihe["zusammenfassung"], ""])
 
         for spalte, wert in enumerate(werte, 1):
@@ -471,7 +780,8 @@ def excel():
         link.alignment = Alignment("center", "center")
         ws.row_dimensions[nr].height = 44
 
-    breiten = [14, 22, 26, 12] + [11] * len(KRITERIEN) + [13, 46, 11, 10]
+    breiten = ([14, 22, 26, 12] + [14, 15, 13, 22]
+               + [11] * len(KRITERIEN) + [13, 46, 11, 10])
     for i, breite in enumerate(breiten, 1):
         ws.column_dimensions[get_column_letter(i)].width = breite
     ws.freeze_panes = "B2"
@@ -496,6 +806,45 @@ def excel():
 
 # ---------------------------------------------------------------- Oberflaeche
 
+LOGIN = """<!doctype html><html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Anmelden</title><style>
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+padding:20px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+color:#152238;
+background:
+radial-gradient(900px 520px at 88% 96%,rgba(120,170,235,.20),transparent 62%),
+radial-gradient(700px 420px at 4% 4%,rgba(150,195,245,.16),transparent 60%),
+linear-gradient(170deg,#f4f8fe 0%,#e9f1fc 100%)}
+.box{background:#fff;border-radius:20px;padding:34px 30px;width:100%;max-width:380px;
+box-shadow:0 10px 36px rgba(30,70,150,.14);text-align:center}
+.zeichen{width:68px;height:68px;margin:0 auto 16px;border-radius:50%;
+background:linear-gradient(140deg,{{FARBE}},{{FARBE_DUNKEL}});color:#fff;
+display:flex;align-items:center;justify-content:center;font-size:21px;font-weight:700}
+h1{margin:0 0 4px;font-size:21px;font-weight:700;letter-spacing:-.02em;color:#12224a}
+p.sub{margin:0 0 22px;font-size:13.5px;color:#7e8ca6}
+input{width:100%;padding:13px 15px;border:1px solid #d5e0f2;border-radius:12px;
+font-size:16px;font-family:inherit;background:#fbfcff;color:#152238;text-align:center}
+input:focus{outline:0;border-color:{{FARBE}};background:#fff}
+button{margin-top:12px;width:100%;background:linear-gradient(100deg,{{FARBE}},#2f6ae0);
+color:#fff;border:0;border-radius:12px;padding:14px;font-size:15.5px;font-weight:600;
+font-family:inherit;cursor:pointer;box-shadow:0 7px 20px rgba(30,80,190,.30)}
+button:active{transform:translateY(1px)}
+.warn{margin:0 0 14px;background:#fdeceb;color:{{AKZENT}};border-radius:11px;
+padding:11px 14px;font-size:13.5px;font-weight:500}
+</style></head><body>
+<form class="box" method="post" action="/login">
+<div class="zeichen">{{KUERZEL}}</div>
+<h1>Bewerbungen</h1>
+<p class="sub">Bitte Passwort eingeben</p>
+{{MELDUNG}}
+<input type="password" name="passwort" placeholder="Passwort" autofocus
+autocomplete="current-password">
+<button type="submit">Anmelden</button>
+</form></body></html>"""
+
+
 SEITE = """<!doctype html><html lang="de"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Bewerbungen — {{FIRMA}}</title><style>
@@ -506,20 +855,18 @@ background:
 radial-gradient(900px 520px at 88% 96%,rgba(120,170,235,.20),transparent 62%),
 radial-gradient(700px 420px at 4% 4%,rgba(150,195,245,.16),transparent 60%),
 linear-gradient(170deg,#f4f8fe 0%,#e9f1fc 100%)}
-.huelle{max-width:720px;margin:0 auto;padding:18px 16px 40px}
+.huelle{max-width:860px;margin:0 auto;padding:18px 16px 40px}
 
-/* Kopfzeile mit Logo */
-.marke{display:flex;align-items:center;gap:12px;padding:4px 2px 0}
-.marke img{height:46px;width:auto}
-.marke .kuerzel{height:46px;width:46px;flex:0 0 46px;border-radius:50%;
+.marke{display:flex;align-items:center;gap:14px;padding:6px 2px 2px}
+.marke img{height:66px;width:auto;flex:0 0 auto}
+.marke .kuerzel{height:66px;width:66px;flex:0 0 66px;border-radius:50%;
 background:linear-gradient(140deg,{{FARBE}},{{FARBE_DUNKEL}});color:#fff;
-display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:700}
-.marke h1{margin:0;font-size:21px;font-weight:700;letter-spacing:-.02em;color:#12224a}
+display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:700}
+.marke h1{margin:0;font-size:24px;font-weight:700;letter-spacing:-.02em;color:#12224a}
 .marke h1 i{font-style:normal;color:{{AKZENT}}}
 .marke p{margin:0;font-size:11px;letter-spacing:.13em;text-transform:uppercase;
 color:#8fa2c2;font-weight:500}
 
-/* Blaues Band */
 .band{margin-top:18px;border-radius:18px;padding:22px 24px;color:#fff;position:relative;
 overflow:hidden;display:flex;align-items:center;gap:16px;
 background:linear-gradient(115deg,{{FARBE_DUNKEL}} 0%,{{FARBE}} 58%,#2a5fd0 100%);
@@ -531,49 +878,46 @@ rgba(120,190,255,.55),rgba(60,120,220,.20) 52%,transparent 72%)}
 background:rgba(255,255,255,.16);display:flex;align-items:center;justify-content:center;
 font-size:24px;position:relative;z-index:1}
 .band .txt{position:relative;z-index:1;min-width:0}
+.warnbalken{margin-top:16px;background:#fdeceb;border:1px solid #f3cfcd;
+border-radius:14px;padding:13px 16px;font-size:13.5px;color:{{AKZENT}};
+font-weight:500;line-height:1.5}
+.warnbalken b{display:block;font-weight:700;margin-bottom:2px}
 .band h2{margin:0;font-size:19px;font-weight:700;letter-spacing:-.015em}
 .band p{margin:2px 0 0;font-size:13.5px;opacity:.86}
-.band .strich{position:relative;z-index:1;margin-top:12px;height:4px;width:min(300px,60%);
-border-radius:3px;background:rgba(255,255,255,.22);overflow:hidden}
-.band .strich i{display:block;height:100%;width:62%;border-radius:3px;
-background:linear-gradient(90deg,#7fc0ff,#d8ecff)}
 
-/* Ablageflaeche */
 .zone{margin-top:16px;background:#fff;border-radius:20px;padding:12px;
 box-shadow:0 6px 26px rgba(30,70,150,.10);transition:.18s ease}
-.zone .innen{border:2px dashed #b9cdea;border-radius:15px;padding:36px 18px;
+.zone .innen{border:2px dashed #b9cdea;border-radius:15px;padding:30px 18px;
 text-align:center;transition:.18s ease}
 .zone.aktiv{transform:scale(1.012)}
 .zone.aktiv .innen{border-color:{{FARBE}};background:{{FARBE_HELL}}}
-.zone .sym{width:66px;height:66px;margin:0 auto;border-radius:50%;
+.zone .sym{width:60px;height:60px;margin:0 auto;border-radius:50%;
 background:radial-gradient(circle at 50% 38%,#fff,{{FARBE_HELL}});
 border:1px solid #dbe7f8;display:flex;align-items:center;justify-content:center;
-font-size:28px;box-shadow:0 3px 14px rgba(40,90,180,.13)}
-.zone h3{margin:14px 0 2px;font-size:21px;font-weight:700;letter-spacing:-.02em;color:#12224a}
+font-size:26px;box-shadow:0 3px 14px rgba(40,90,180,.13)}
+.zone h3{margin:12px 0 2px;font-size:20px;font-weight:700;letter-spacing:-.02em;color:#12224a}
 .zone .unter{margin:0;color:#7e8ca6;font-size:14px}
-.marken{display:flex;gap:8px;justify-content:center;margin-top:13px;flex-wrap:wrap}
+.marken{display:flex;gap:8px;justify-content:center;margin-top:12px;flex-wrap:wrap}
 .marken span{font-size:12px;font-weight:700;letter-spacing:.5px;color:{{FARBE}};
 background:{{FARBE_HELL}};border:1px solid #dbe7f8;border-radius:9px;padding:5px 15px}
 
-/* Knoepfe */
 button{font-family:inherit;cursor:pointer;border:0;font-weight:600}
-.haupt{margin-top:18px;background:linear-gradient(100deg,{{FARBE}},#2f6ae0);
+.haupt{margin-top:16px;background:linear-gradient(100deg,{{FARBE}},#2f6ae0);
 color:#fff;border-radius:13px;padding:15px 26px;font-size:15.5px;width:100%;max-width:330px;
 display:inline-flex;align-items:center;justify-content:center;gap:10px;
 box-shadow:0 7px 20px rgba(30,80,190,.30);transition:.15s}
-.haupt:active{transform:translateY(1px);box-shadow:0 4px 12px rgba(30,80,190,.28)}
-.haupt .pfeil{font-size:18px;line-height:1}
+.haupt:active{transform:translateY(1px)}
+.haupt:disabled{opacity:.55;box-shadow:none}
 .zweit{width:100%;background:#fff;color:{{FARBE}};border:1.6px solid {{FARBE}};
-border-radius:13px;padding:14px 20px;font-size:15px;
-display:inline-flex;align-items:center;justify-content:center;gap:10px}
+border-radius:13px;padding:13px 20px;font-size:15px;
+display:inline-flex;align-items:center;justify-content:center;gap:9px}
 .zweit:active{background:{{FARBE_HELL}}}
 
-.trenner{display:flex;align-items:center;gap:12px;margin:22px 0 14px;
+.trenner{display:flex;align-items:center;gap:12px;margin:20px 0 13px;
 color:#8fa2c2;font-size:13px;font-weight:600}
 .trenner:before,.trenner:after{content:"";flex:1;height:1px;background:#d6e2f3}
 
-/* Karten */
-.karte{background:#fff;border-radius:20px;padding:20px 22px;margin-top:16px;
+.karte{background:#fff;border-radius:20px;padding:18px 20px;margin-top:16px;
 box-shadow:0 6px 26px rgba(30,70,150,.10)}
 .karte.aus{display:none}
 input,textarea{width:100%;padding:12px 14px;border:1px solid #d5e0f2;border-radius:11px;
@@ -581,27 +925,65 @@ font-size:15px;font-family:inherit;margin-bottom:10px;background:#fbfcff;color:#
 input:focus,textarea:focus{outline:0;border-color:{{FARBE}};background:#fff}
 textarea{min-height:150px;resize:vertical}
 
-.oben{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
-.nam{font-size:18px;font-weight:700;margin:0;letter-spacing:-.01em;color:#12224a}
-.pill{display:inline-block;font-size:12px;font-weight:700;padding:4px 12px;
-border-radius:20px;margin-top:7px}
-.note{font-size:36px;font-weight:700;line-height:1;text-align:right;color:#12224a}
-.note span{font-size:15px;color:#9aa9c2;font-weight:500}
-.note small{display:block;font-size:12px;color:#7e8ca6;font-weight:500;margin-bottom:2px}
-hr{border:0;border-top:1px solid #e7eefa;margin:16px 0}
-.zeile{margin-bottom:12px}
-.lab{display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px}
+.fortschritt{margin-top:16px;background:#fff;border-radius:16px;padding:15px 18px;
+box-shadow:0 6px 26px rgba(30,70,150,.10);display:none}
+.fortschritt.an{display:block}
+.fortschritt p{margin:0 0 9px;font-size:14px;font-weight:600;color:{{FARBE}}}
+.fortschritt .spur{height:8px;background:#eaeef6;border-radius:5px;overflow:hidden}
+.fortschritt .spur i{display:block;height:100%;width:0;border-radius:5px;
+background:linear-gradient(90deg,{{FARBE}},#4f8fe8);transition:width .3s ease}
+
+.fehler{background:#fdeceb;color:{{AKZENT}};border-radius:12px;padding:12px 15px;
+font-size:14px;margin-top:12px;font-weight:500}
+
+.tabkopf{display:flex;align-items:center;justify-content:space-between;gap:12px;
+flex-wrap:wrap;margin-bottom:4px}
+.tabkopf h2{margin:0;font-size:18px;font-weight:700;color:#12224a;letter-spacing:-.01em}
+.tabkopf .zahl{font-size:13px;color:#7e8ca6;font-weight:500}
+.tabkopf .xls{background:linear-gradient(100deg,{{FARBE}},#2f6ae0);color:#fff;
+border-radius:11px;padding:11px 18px;font-size:14px;display:inline-flex;
+align-items:center;gap:8px;box-shadow:0 5px 15px rgba(30,80,190,.26)}
+
+.leer{text-align:center;padding:26px 10px;color:#9aa9c2;font-size:14px}
+
+.reihe{border-top:1px solid #eef3fb}
+.reihe:first-of-type{border-top:0}
+.kopfzeile{display:flex;align-items:center;gap:12px;padding:13px 2px;cursor:pointer}
+.ampel{width:10px;height:38px;border-radius:5px;flex:0 0 10px}
+.wer{flex:1;min-width:0}
+.wer b{display:block;font-size:15.5px;font-weight:600;color:#12224a;
+white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.wer small{display:block;font-size:12.5px;color:#7e8ca6;
+white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.wert{text-align:right;flex:0 0 auto}
+.wert b{font-size:20px;font-weight:700;color:#12224a;line-height:1.1}
+.wert small{display:block;font-size:11px;color:#9aa9c2}
+.pfeilchen{flex:0 0 14px;color:#b6c2d6;font-size:13px;transition:transform .2s}
+.reihe.offen .pfeilchen{transform:rotate(90deg)}
+
+.detail{display:none;padding:2px 2px 18px 24px}
+.reihe.offen .detail{display:block}
+.zeile{margin-bottom:10px}
+.lab{display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px}
 .lab span{color:#7e8ca6}
 .lab em{font-style:normal;color:#a7b5cc;font-size:11px;margin-left:5px}
 .lab b{font-weight:700;color:#12224a}
-.spur{height:9px;background:#eef3fb;border-radius:5px;overflow:hidden}
-.spur i{display:block;height:100%;width:0;border-radius:5px;transition:width .45s ease}
-.fazit{font-size:14px;color:#48566e;margin:0}
-.fuss{font-size:13px;color:#7e8ca6;margin:6px 0 0}
-
-.lade{text-align:center;color:{{FARBE}};font-size:14px;font-weight:600;padding:16px 0}
-.fehler{background:#fdecea;color:{{AKZENT}};border-radius:12px;padding:12px 15px;
-font-size:14px;margin-top:12px;font-weight:500}
+.spur{height:8px;background:#eef3fb;border-radius:5px;overflow:hidden}
+.spur i{display:block;height:100%;border-radius:5px}
+.blocktitel{margin:15px 0 8px;font-size:12px;font-weight:700;letter-spacing:.09em;
+text-transform:uppercase;color:#8fa2c2}
+.verf{list-style:none;margin:0;padding:0;display:grid;gap:6px}
+.verf li{display:flex;align-items:baseline;gap:10px;font-size:14px}
+.verf li b{flex:0 0 78px;font-weight:500;color:#7e8ca6;font-size:13px}
+.verf li span{color:#12224a;font-weight:500}
+.verf li.offen span{color:#9aa9c2;font-weight:400;font-style:italic}
+.fazit{font-size:14px;color:#48566e;margin:14px 0 0}
+.fuss{font-size:13px;color:#7e8ca6;margin:5px 0 0}
+.knoepfe{display:flex;gap:9px;margin-top:14px;flex-wrap:wrap}
+.knoepfe a,.knoepfe button{font-size:13.5px;font-weight:600;border-radius:10px;
+padding:10px 16px;text-decoration:none;display:inline-flex;align-items:center;gap:7px}
+.knoepfe a{background:{{FARBE_HELL}};color:{{FARBE}};border:1px solid #d5e0f2}
+.knoepfe button{background:#fff;color:{{AKZENT}};border:1px solid #f0d4d3}
 
 .sicher{display:flex;align-items:center;justify-content:center;gap:9px;margin:26px 0 0}
 .sicher .schild{font-size:19px}
@@ -615,20 +997,21 @@ font-size:14px;margin-top:12px;font-weight:500}
 <div><h1>Places <i>to</i> Be</h1><p>Bewerbungen sichten</p></div>
 </div>
 
+{{WARNUNG}}
+
 <div class="band">
 <div class="ikon">📄</div>
 <div class="txt"><h2>Bewerbungen verarbeiten</h2>
-<p>Unterlagen hochladen und bewerten lassen.</p>
-<div class="strich"><i></i></div></div>
+<p>Unterlagen hochladen, Liste füllt sich von selbst.</p></div>
 </div>
 
 <div class="zone" id="zone"><div class="innen">
 <div class="sym">☁️</div>
-<h3>Datei hier ablegen</h3>
-<p class="unter">oder unten auswählen</p>
+<h3>Dateien hier ablegen</h3>
+<p class="unter">mehrere auf einmal möglich</p>
 <div class="marken"><span>EML</span><span>PDF</span><span>TXT</span></div>
-<button class="haupt" onclick="datei.click()">Datei auswählen <span class="pfeil">→</span></button>
-<input type="file" id="datei" accept=".eml,.pdf,.txt,.md,.rtf" hidden>
+<button class="haupt" id="waehlen" onclick="datei.click()">Dateien auswählen <span>→</span></button>
+<input type="file" id="datei" accept=".eml,.pdf,.txt,.md,.rtf" multiple hidden>
 </div></div>
 
 <div class="trenner">oder</div>
@@ -639,26 +1022,22 @@ font-size:14px;margin-top:12px;font-weight:500}
 <input id="h-mail" placeholder="E-Mail-Adresse">
 <input id="h-betreff" placeholder="Betreff">
 <textarea id="h-text" placeholder="Bewerbungstext einfügen"></textarea>
-<button class="haupt" style="max-width:none" onclick="sendeText()">Bewerten <span class="pfeil">→</span></button>
+<button class="haupt" style="max-width:none" onclick="sendeText()">Bewerten <span>→</span></button>
 </div>
 
-<div class="lade" id="lade" style="display:none">Wird ausgewertet …</div>
+<div class="fortschritt" id="fortschritt">
+<p id="f-text">Wird ausgewertet …</p>
+<div class="spur"><i id="f-balken"></i></div>
+</div>
+
 <div id="fehler"></div>
 
-<div class="karte aus" id="ergebnis">
-<div class="oben">
-<div><p class="nam" id="r-name">–</p><span class="pill" id="r-pill">–</span></div>
-<div class="note"><small>Gesamt</small><span id="r-note">–</span><span>/10</span></div>
+<div class="karte" id="tabelle">
+<div class="tabkopf">
+<div><h2>Bewertungen</h2><span class="zahl" id="t-zahl">noch keine</span></div>
+<button class="xls" onclick="location.href='/api/excel'">⬇ Excel</button>
 </div>
-<hr>
-{{BALKEN}}
-<hr>
-<p class="fazit" id="r-fazit">–</p>
-<p class="fuss" id="r-fs">–</p>
-<button class="haupt" style="max-width:none" onclick="location.href='/api/excel'">
-⬇ Excel herunterladen</button>
-<button class="zweit" style="margin-top:9px" onclick="zuruecksetzen()">
-Nächste Bewerbung</button>
+<div id="t-inhalt"><p class="leer">Noch nichts verarbeitet. Lad oben eine Bewerbung hoch.</p></div>
 </div>
 
 <div class="sicher"><span class="schild">🛡️</span>
@@ -669,62 +1048,136 @@ Nächste Bewerbung</button>
 <script>
 const zone=document.getElementById('zone'),datei=document.getElementById('datei');
 const KRIT=[{{KRITLISTE}}];
+const VERF=[{{VERFLISTE}}];
+const PILL={gruen:['#d9efdc','#2a6b36','Einladen','#4f8a3d'],
+gelb:['#faeecb','#8a6410','Prüfen','#e0a423'],
+grau:['#ebe9e3','#5f5c56','Angaben fehlen','#a8b0bf'],
+rot:['#f8dcd9','#9c3229','Unpassend','#c4483f']};
+const offeneZeilen=new Set();
 
 ['dragenter','dragover'].forEach(e=>zone.addEventListener(e,v=>{
 v.preventDefault();zone.classList.add('aktiv')}));
 ['dragleave','drop'].forEach(e=>zone.addEventListener(e,v=>{
 v.preventDefault();zone.classList.remove('aktiv')}));
-zone.addEventListener('drop',v=>{if(v.dataTransfer.files[0])schicke(v.dataTransfer.files[0])});
-datei.addEventListener('change',()=>{if(datei.files[0])schicke(datei.files[0])});
+zone.addEventListener('drop',v=>{if(v.dataTransfer.files.length)stapel(v.dataTransfer.files)});
+datei.addEventListener('change',()=>{if(datei.files.length)stapel(datei.files)});
 
 function handForm(){document.getElementById('hand').classList.toggle('aus')}
-function laden(an){document.getElementById('lade').style.display=an?'block':'none'}
 function fehler(t){document.getElementById('fehler').innerHTML=
 t?'<div class="fehler">'+t+'</div>':''}
+function farbe(n){return n>=7?'#4f8a3d':n>=4?'#c98a1e':'#c4483f'}
 
-async function schicke(f){
-fehler('');laden(true);
-const fd=new FormData();fd.append('file',f);
-try{const a=await fetch('/api/upload',{method:'POST',body:fd});
-const d=await a.json();if(!a.ok)throw new Error(d.fehler||'Fehler');zeige(d)}
-catch(e){fehler(e.message)}finally{laden(false);datei.value=''}}
+function fortschritt(an,text,anteil){
+const box=document.getElementById('fortschritt');
+box.classList.toggle('an',an);
+if(text)document.getElementById('f-text').textContent=text;
+document.getElementById('f-balken').style.width=(anteil||0)+'%';
+document.getElementById('waehlen').disabled=an}
+
+async function stapel(dateien){
+fehler('');const liste=Array.from(dateien),probleme=[];
+for(let i=0;i<liste.length;i++){
+const f=liste[i];
+fortschritt(true,liste.length>1?('Verarbeite '+(i+1)+' von '+liste.length+': '+f.name)
+:'Wird ausgewertet …',Math.round(i/liste.length*100));
+try{const fd=new FormData();fd.append('file',f);
+const a=await fetch('/api/upload',{method:'POST',body:fd});
+const d=await a.json();
+if(!a.ok)throw new Error(d.fehler||'Fehler');
+}catch(e){probleme.push(f.name+': '+e.message)}}
+fortschritt(false);datei.value='';
+if(probleme.length)fehler('Nicht verarbeitet<br>'+probleme.join('<br>'));
+await ladeListe()}
 
 async function sendeText(){
 const text=document.getElementById('h-text').value.trim();
 if(!text){fehler('Bitte den Bewerbungstext einfügen.');return}
-fehler('');laden(true);
+fehler('');fortschritt(true,'Wird ausgewertet …',40);
 try{const a=await fetch('/api/text',{method:'POST',
 headers:{'Content-Type':'application/json'},body:JSON.stringify({
 name:document.getElementById('h-name').value,
 absender:document.getElementById('h-mail').value,
 betreff:document.getElementById('h-betreff').value,text:text})});
 const d=await a.json();if(!a.ok)throw new Error(d.fehler||'Fehler');
-document.getElementById('hand').classList.add('aus');zeige(d)}
-catch(e){fehler(e.message)}finally{laden(false)}}
-
-function farbe(n){return n>=7?'#4f8a3d':n>=4?'#c98a1e':'#c4483f'}
-const PILL={gruen:['#d9efdc','#2a6b36','Einladen'],gelb:['#faeecb','#8a6410','Prüfen'],
-grau:['#ebe9e3','#5f5c56','Angaben fehlen'],rot:['#f8dcd9','#9c3229','Unpassend']};
-
-function zeige(d){
-document.getElementById('r-name').textContent=d.name;
-document.getElementById('r-note').textContent=d.gesamt;
-const p=PILL[d.status]||PILL.grau,pill=document.getElementById('r-pill');
-pill.textContent=p[2];pill.style.background=p[0];pill.style.color=p[1];
-KRIT.forEach(k=>{const v=d.scores[k]||0;
-document.getElementById('w-'+k).textContent=v;
-const b=document.getElementById('b-'+k);
-b.style.background=farbe(v);setTimeout(()=>b.style.width=(v*10)+'%',30)});
-document.getElementById('r-fazit').textContent=d.zusammenfassung;
-document.getElementById('r-fs').textContent='Führerschein: '+d.fuehrerschein;
-document.getElementById('ergebnis').classList.remove('aus');
-document.getElementById('ergebnis').scrollIntoView({behavior:'smooth',block:'start'})}
-
-function zuruecksetzen(){
-document.getElementById('ergebnis').classList.add('aus');
-KRIT.forEach(k=>document.getElementById('b-'+k).style.width='0');
 ['h-name','h-mail','h-betreff','h-text'].forEach(i=>document.getElementById(i).value='');
-fehler('');window.scrollTo({top:0,behavior:'smooth'})}
+document.getElementById('hand').classList.add('aus')}
+catch(e){fehler(e.message)}
+finally{fortschritt(false);await ladeListe()}}
+
+function kurzInfo(v){
+const teile=[];
+VERF.forEach(f=>{const w=(v[f[0]]||'').trim();
+if(w&&w.toLowerCase()!=='unbekannt'&&f[0]!=='hinweis')teile.push(w)});
+return teile.length?teile.join(' · '):'keine Angaben zur Verfügbarkeit'}
+
+async function ladeListe(){
+let d;try{d=await(await fetch('/api/liste')).json()}catch(e){return}
+const ziel=document.getElementById('t-inhalt');
+document.getElementById('t-zahl').textContent=
+d.anzahl===0?'noch keine':(d.anzahl===1?'1 Bewerbung':d.anzahl+' Bewerbungen');
+if(!d.anzahl){ziel.innerHTML=
+'<p class="leer">Noch nichts verarbeitet. Lad oben eine Bewerbung hoch.</p>';return}
+ziel.innerHTML='';
+d.eintraege.forEach(e=>{
+const p=PILL[e.status]||PILL.grau;
+const reihe=document.createElement('div');
+reihe.className='reihe'+(offeneZeilen.has(e.id)?' offen':'');
+
+const kopf=document.createElement('div');kopf.className='kopfzeile';
+kopf.onclick=()=>{if(offeneZeilen.has(e.id))offeneZeilen.delete(e.id);
+else offeneZeilen.add(e.id);
+reihe.classList.toggle('offen',offeneZeilen.has(e.id))};
+kopf.innerHTML='<div class="ampel" style="background:'+p[3]+'"></div>'+
+'<div class="wer"><b></b><small></small></div>'+
+'<div class="wert"><b></b><small>'+p[2]+'</small></div>'+
+'<div class="pfeilchen">▶</div>';
+kopf.querySelector('.wer b').textContent=e.name||'Unbekannt';
+kopf.querySelector('.wer small').textContent=kurzInfo(e.verfuegbarkeit||{});
+kopf.querySelector('.wert b').textContent=e.gesamt;
+reihe.appendChild(kopf);
+
+const det=document.createElement('div');det.className='detail';
+KRIT.forEach(k=>{const v=e.scores[k[0]]||0;
+const z=document.createElement('div');z.className='zeile';
+z.innerHTML='<div class="lab"><span>'+k[1]+'<em>'+k[2]+'%</em></span><b>'+v+'</b></div>'+
+'<div class="spur"><i style="width:'+(v*10)+'%;background:'+farbe(v)+'"></i></div>';
+det.appendChild(z)});
+
+const vt=document.createElement('p');vt.className='blocktitel';
+vt.textContent='Verfügbarkeit';det.appendChild(vt);
+const ul=document.createElement('ul');ul.className='verf';
+VERF.forEach(f=>{const w=((e.verfuegbarkeit||{})[f[0]]||'unbekannt').trim();
+const leer=w.toLowerCase()==='unbekannt';
+const li=document.createElement('li');if(leer)li.className='offen';
+const b=document.createElement('b');b.textContent=f[1];
+const s=document.createElement('span');s.textContent=leer?'keine Angabe':w;
+li.appendChild(b);li.appendChild(s);ul.appendChild(li)});
+det.appendChild(ul);
+
+const fz=document.createElement('p');fz.className='fazit';
+fz.textContent=e.zusammenfassung||'';det.appendChild(fz);
+const fs=document.createElement('p');fs.className='fuss';
+fs.textContent='Führerschein: '+(e.fuehrerschein||'unbekannt')+
+(e.absender?'  ·  '+e.absender:'');det.appendChild(fs);
+
+const kn=document.createElement('div');kn.className='knoepfe';
+const link=document.createElement('a');link.href='/mail/'+e.id;
+link.target='_blank';link.textContent='📄 Bewerbung öffnen';kn.appendChild(link);
+const del=document.createElement('button');del.textContent='🗑 Entfernen';
+let sicher=false;
+del.onclick=async ev=>{ev.stopPropagation();
+if(!sicher){sicher=true;del.textContent='Wirklich entfernen?';
+setTimeout(()=>{sicher=false;del.textContent='🗑 Entfernen'},4000);return}
+await fetch('/api/loeschen/'+e.id,{method:'POST'});
+offeneZeilen.delete(e.id);ladeListe()};
+kn.appendChild(del);det.appendChild(kn);
+
+reihe.appendChild(det);ziel.appendChild(reihe)})}
+
+ladeListe();
 </script></body></html>"""
 
-SEITE = SEITE.replace("{{KRITLISTE}}", ",".join(f"'{k}'" for k, _, _ in KRITERIEN))
+SEITE = SEITE.replace("{{KRITLISTE}}",
+                      ",".join(f"['{k}','{t}',{g}]" for k, t, g, _ in KRITERIEN))
+SEITE = SEITE.replace("{{VERFLISTE}}",
+                      ",".join(f"['{k}','{t}']" for k, t in VERFUEG_FELDER))

@@ -7,20 +7,28 @@ Auf Railway:  laeuft ueber das Procfile automatisch.
 import email
 import hashlib
 import io
+import html
 import json
+import math
 import os
 import re
 import secrets
 import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from email.header import decode_header
+from urllib.parse import parse_qs, quote
 
-from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi import FastAPI, File, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from openpyxl import Workbook
+from openpyxl.formatting.rule import ColorScaleRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.worksheet.properties import PageSetupProperties
 
 # ---------------------------------------------------------------- Einstellungen
 
@@ -41,6 +49,8 @@ def kuerzel_aus(name):
     """Bildet ein Kuerzel, falls kein Logo hinterlegt ist."""
     teile = [w for w in re.split(r"\s+", name) if w]
     return "".join(w[0] for w in teile[:3]).upper() or "?"
+
+
 AUFBEWAHRUNG_TAGE = 3
 
 DB = os.environ.get("DB_PATH", "/tmp/bewerbungen.db")
@@ -49,8 +59,19 @@ MODELL = os.environ.get("AI_MODEL", "claude-sonnet-4-6")
 
 # --- Schutz gegen Missbrauch und ausufernde Kosten ---
 PASSWORT = os.environ.get("PASSWORT", "")
-TAGESLIMIT = int(os.environ.get("TAGESLIMIT", "150"))   # Bewertungen pro Tag
-MAX_MB = float(os.environ.get("MAX_MB", "8"))           # groesste erlaubte Datei
+def zahl_lesen(name, vorgabe, kleinste, groesste):
+    """Liest eine Zahl aus einer Variable. Bei Tippfehlern gilt die Vorgabe."""
+    try:
+        wert = float(os.environ.get(name, "").strip().replace(",", "."))
+    except ValueError:
+        return vorgabe
+    if not math.isfinite(wert):
+        return vorgabe
+    return max(kleinste, min(groesste, wert))
+
+
+TAGESLIMIT = int(zahl_lesen("TAGESLIMIT", 150, 1, 100000))   # Bewertungen pro Tag
+MAX_MB = zahl_lesen("MAX_MB", 8, 0.5, 50)                     # groesste erlaubte Datei
 
 # Wert, den der Zutritts-Cookie tragen muss. Aendert sich mit dem Passwort.
 MARKE = hashlib.sha256(("ptb-zutritt-" + PASSWORT).encode()).hexdigest()[:40]
@@ -75,6 +96,10 @@ KRITERIEN_VORGABE = [
 ]
 
 
+# Diese Namen nutzt die App selbst, sie duerfen kein Kriterium heissen.
+RESERVIERT = {"fehler", "erstattet", "fuehrerschein", "zusammenfassung", "verfuegbarkeit"}
+
+
 def kriterien_lesen():
     """Liest die Kriterien aus der Variable. Faellt auf die Vorgabe zurueck."""
     roh = os.environ.get("KRITERIEN", "").strip()
@@ -90,12 +115,15 @@ def kriterien_lesen():
         if len(teile) < 3:
             continue
         schluessel = re.sub(r"[^a-z0-9_]", "", teile[0].lower())
-        if not schluessel:
+        if not schluessel or schluessel in RESERVIERT:
             continue
         try:
-            gewicht = max(1, min(100, int(float(teile[2]))))
+            zahl = float(teile[2].replace(",", "."))
         except ValueError:
             continue
+        if not math.isfinite(zahl):
+            continue
+        gewicht = max(1, min(100, int(zahl)))
         titel = teile[1] or schluessel
         erklaerung = teile[3] if len(teile) > 3 else titel
         gelesen.append((schluessel, titel, gewicht, erklaerung))
@@ -118,9 +146,10 @@ GEWICHT_SUMME = sum(g for _, _, g, _ in KRITERIEN) or 1
 
 STATUS_FARBEN = {
     "gruen": ("C6EFCE", "Einladen"),
-    "gelb": ("FFEB9C", "Pruefen"),
+    "gelb": ("FFEB9C", "Prüfen"),
     "grau": ("E7E6E6", "Angaben fehlen"),
     "rot": ("FFC7CE", "Unpassend"),
+    "fehler": ("F8CBAD", "Bewertung fehlgeschlagen"),
 }
 
 # ---------------------------------------------------------------- Datenbank
@@ -158,7 +187,8 @@ def init():
 
 
 def heute():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    """Der heutige Tag in deutscher Zeit. Das Tageslimit springt um Mitternacht zurueck."""
+    return berlin_zeit(datetime.now(timezone.utc)).strftime("%Y-%m-%d")
 
 
 def verbrauch_heute():
@@ -184,8 +214,15 @@ def kontingent_buchen():
         return zeiger.rowcount > 0
 
 
+def kontingent_zurueck():
+    """Gibt eine Buchung zurueck, wenn der KI-Aufruf gar nicht erst geklappt hat."""
+    with conn() as c:
+        c.execute("UPDATE tageszaehler SET anzahl = MAX(0, anzahl - 1) WHERE tag = ?",
+                  (heute(),))
+
+
 def aufraeumen():
-    grenze = (datetime.now(timezone.utc) - timedelta(days=AUFBEWAHRUNG_TAGE)).isoformat()
+    grenze =(datetime.now(timezone.utc) - timedelta(days=AUFBEWAHRUNG_TAGE)).isoformat()
     with conn() as c:
         c.execute("DELETE FROM bewerbungen WHERE angelegt < ?", (grenze,))
 
@@ -193,16 +230,32 @@ def aufraeumen():
 # ---------------------------------------------------------------- Mail lesen
 
 
+STEUERZEICHEN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def sauber(wert, laenge=None):
+    """Entfernt unsichtbare Steuerzeichen (die z.B. die Excel-Ausgabe stoeren) und kuerzt."""
+    wert = STEUERZEICHEN.sub("", str(wert or "")).strip()
+    return wert[:laenge] if laenge else wert
+
+
 def kopf(wert):
     if not wert:
         return ""
     teile = []
-    for stueck, kodierung in decode_header(wert):
+    try:
+        stuecke = decode_header(wert)
+    except Exception:
+        return sauber(str(wert))
+    for stueck, kodierung in stuecke:
         if isinstance(stueck, bytes):
-            teile.append(stueck.decode(kodierung or "utf-8", errors="replace"))
+            try:
+                teile.append(stueck.decode(kodierung or "utf-8", errors="replace"))
+            except LookupError:                      # unbekannter Zeichensatz
+                teile.append(stueck.decode("utf-8", errors="replace"))
         else:
             teile.append(stueck)
-    return "".join(teile).strip()
+    return sauber("".join(teile))
 
 
 def html_zu_text(roh):
@@ -210,8 +263,7 @@ def html_zu_text(roh):
     roh = re.sub(r"(?i)<br\s*/?>", "\n", roh)
     roh = re.sub(r"(?i)</p>", "\n\n", roh)
     roh = re.sub(r"<[^>]+>", " ", roh)
-    roh = roh.replace("&nbsp;", " ").replace("&amp;", "&")
-    roh = roh.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"')
+    roh = html.unescape(roh).replace("\xa0", " ")
     return re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t]{2,}", " ", roh)).strip()
 
 
@@ -227,12 +279,25 @@ def pdf_zu_text(rohdaten):
         return ""
 
 
+def text_entschluesseln(rohdaten, zeichensatz=None):
+    """Wandelt Bytes in Text. Probiert den angegebenen Zeichensatz, dann UTF-8,
+    dann Windows-1252 (typisch fuer aeltere Word- und Outlook-Dateien)."""
+    for versuch in (zeichensatz, "utf-8", "cp1252"):
+        if not versuch:
+            continue
+        try:
+            return rohdaten.decode(versuch)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return rohdaten.decode("utf-8", errors="replace")
+
+
 def eml_lesen(rohdaten):
     msg = email.message_from_bytes(rohdaten)
     absender = kopf(msg.get("From"))
     betreff = kopf(msg.get("Subject"))
 
-    text, html, anhaenge = "", "", []
+    text, html_teil, anhaenge = "", "", []
     if msg.is_multipart():
         for teil in msg.walk():
             if teil.get_content_maintype() == "multipart":
@@ -252,24 +317,22 @@ def eml_lesen(rohdaten):
                 inhalt = teil.get_payload(decode=True)
                 if inhalt is None:
                     continue
-                zeichensatz = teil.get_content_charset() or "utf-8"
-                entpackt = inhalt.decode(zeichensatz, errors="replace")
+                entpackt = text_entschluesseln(inhalt, teil.get_content_charset())
             except Exception:
                 continue
             if teil.get_content_type() == "text/plain" and not text:
                 text = entpackt
-            elif teil.get_content_type() == "text/html" and not html:
-                html = entpackt
+            elif teil.get_content_type() == "text/html" and not html_teil:
+                html_teil = entpackt
     else:
         inhalt = msg.get_payload(decode=True) or b""
-        zeichensatz = msg.get_content_charset() or "utf-8"
-        entpackt = inhalt.decode(zeichensatz, errors="replace")
+        entpackt = text_entschluesseln(inhalt, msg.get_content_charset())
         if msg.get_content_type() == "text/html":
-            html = entpackt
+            html_teil = entpackt
         else:
             text = entpackt
 
-    koerper = text.strip() or html_zu_text(html)
+    koerper = text.strip() or html_zu_text(html_teil)
     if anhaenge:
         koerper = (koerper + "\n\n" + "\n\n".join(anhaenge)).strip()
 
@@ -286,28 +349,34 @@ def eml_lesen(rohdaten):
 # ---------------------------------------------------------------- Bewertung
 
 def mail_raten(text):
-    treffer = re.search(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", text)
+    # Begrenzte Laengen, damit lange Zeichenketten ohne Leerzeichen nicht ewig dauern.
+    treffer = re.search(r"[\w.+-]{1,64}@[\w-]{1,63}(?:\.[\w-]{1,63}){1,8}", text[:20000])
     return treffer.group(0).rstrip(".,;:") if treffer else ""
 
 
+GRUSS = (r"(?:(?:Viele|Beste|Freundliche|Liebe|Herzliche|Sonnige|Schöne)\s+Gr(?:ü|ue|u)(?:ß|ss)en?"
+         r"|Mit\s+(?:freundlichen|besten|lieben|herzlichen)\s+Gr(?:ü|ue|u)(?:ß|ss)en"
+         r"|Mit\s+freundlichem\s+Gru(?:ß|ss)|MfG|LG|VG|Best regards|Kind regards|Regards)")
+NAME = r"([A-ZÄÖÜ][\wäöüß'-]+(?:[ \t]+[A-ZÄÖÜ][\wäöüß'-]+){0,2})"   # nur innerhalb einer Zeile
+
+
 def name_raten(text, dateiname=""):
-    """Sucht den Namen: erst in der Grussformel am Ende, dann im Dateinamen."""
-    schluss = text[-400:]
-    for muster in (r"(?:Viele|Beste|Freundliche|Liebe|Herzliche)\s+Gr[uü][sß]{1,2}e,?\s*\n+\s*"
-                   r"([A-ZÄÖÜ][\wäöüß'-]+(?:\s+[A-ZÄÖÜ][\wäöüß'-]+){0,2})",
-                   r"Mit freundlichen Gr[uü][sß]{1,2}en,?\s*\n+\s*"
-                   r"([A-ZÄÖÜ][\wäöüß'-]+(?:\s+[A-ZÄÖÜ][\wäöüß'-]+){0,2})"):
-        treffer = re.search(muster, schluss)
-        if treffer:
-            return treffer.group(1).strip()
+    """Sucht den Namen: erst in der Grussformel am Ende, dann im Text, dann im Dateinamen."""
+    schluss = text[-500:]
+    treffer = None
+    for treffer in re.finditer(r"(?<!\w)" + GRUSS + r",?[ \t]*\r?\n+\s*" + NAME, schluss):
+        pass                                  # die letzte Grussformel zaehlt
+    if treffer:
+        return treffer.group(1).strip()
 
     treffer = re.search(r"(?:mein Name ist|Ich hei[sß]e)\s+"
-                        r"([A-ZÄÖÜ][\wäöüß'-]+(?:\s+[A-ZÄÖÜ][\wäöüß'-]+){0,2})", text[:1500])
+                        + NAME, text[:1500])
     if treffer:
         return treffer.group(1).strip()
 
     roh = re.sub(r"\.[^.]+$", "", dateiname)
-    roh = re.sub(r"(?i)bewerbung|lebenslauf|anschreiben|cv|final|neu", " ", roh)
+    roh = re.sub(r"(?i)bewerbung|lebenslauf|anschreiben|unterlagen|dokument|document"
+                 r"|scan|datei|image|img|cv|final|neu", " ", roh)
     roh = re.sub(r"[_\-.]+", " ", roh).strip()
     woerter = [w for w in roh.split() if len(w) > 1 and not w.isdigit()][:3]
     return " ".join(w.capitalize() for w in woerter) or "Unbekannt"
@@ -331,18 +400,26 @@ def prompt_bauen():
         "je Kriterium:\n\n"
         + punkte + "\n\n"
         "Wenn zu einem Kriterium nichts im Text steht, gib 3 und erwaehne die Luecke.\n\n"
-        "Erfasse ausserdem die Verfuegbarkeit. Das wird nicht benotet, sondern als\n"
+        "Erfasse ausserdem ein paar Eckdaten. Das wird nicht benotet, sondern als\n"
         "Fakten gesammelt. Nimm nur, was wirklich im Text steht, und erfinde nichts.\n"
-        "Steht etwas nicht drin, schreibe genau \"unbekannt\".\n\n"
-        "- ab: ab wann die Person kann, z.B. \"sofort\", \"ab 15.10.\"\n"
-        "- dauer: fuer welchen Zeitraum, z.B. \"3 Monate\", \"unbefristet\"\n"
-        "- umfang: \"Vollzeit\", \"Teilzeit\", \"Minijob\", \"Wochenenden\" oder \"unbekannt\"\n"
-        "- hinweis: eine kurze Einschraenkung in hoechstens 6 Woertern. Sonst \"unbekannt\".\n\n"
+        "Steht zu einem Feld nichts im Text, schreibe genau \"unbekannt\".\n\n"
+        "- zeitraum: ab wann und wie lange die Person kann, in einem kurzen Ausdruck.\n"
+        "  Beispiele: \"sofort, 3 Monate\", \"ab 15.10., bis 31.1.\", \"ab Februar, unbefristet\"\n"
+        "- beschaeftigung: was die Person aktuell macht.\n"
+        "  Beispiele: \"Student (BWL, 3. Semester)\", \"Schueler\", \"Angestellt in Vollzeit\",\n"
+        "  \"Arbeitssuchend\", \"Azubi im 2. Lehrjahr\", \"Selbststaendig\"\n"
+        "- sprachen: alle Sprachen, die die Person nennt, jeweils mit dem Niveau, das\n"
+        "  im Text steht. Muttersprache zuerst, mehrere durch Komma trennen.\n"
+        "  Beispiele: \"Deutsch (Muttersprache), Englisch (fliessend), Tuerkisch (Grundkenntnisse)\",\n"
+        "  \"Deutsch (Muttersprache), Englisch (B2), Franzoesisch (Schulniveau)\".\n"
+        "  Schaetze das Niveau nicht. Nennt der Text eine Sprache ohne Niveau, schreibe\n"
+        "  \"Spanisch (Niveau nicht genannt)\". Nennt der Text gar keine Sprachen,\n"
+        "  schreibe \"unbekannt\".\n\n"
         "Antworte ausschliesslich mit JSON, ohne Vorrede und ohne Codebloecke:\n"
         "{" + felder + ', "fuehrerschein": "ja|nein|unbekannt", '
-        '"verfuegbarkeit": {"ab": "", "dauer": "", "umfang": "", "hinweis": ""}, '
+        '"verfuegbarkeit": {"zeitraum": "", "beschaeftigung": "", "sprachen": ""}, '
         '"zusammenfassung": "ein bis zwei Saetze"}\n\n'
-        "Betreff: {betreff}\n\nText:\n{text}"
+        "Hier ist die Bewerbung:\n\n"
     )
 
 
@@ -350,11 +427,14 @@ PROMPT = prompt_bauen()
 
 
 VERFUEG_FELDER = [
-    ("ab", "Ab wann"),
-    ("dauer", "Dauer"),
-    ("umfang", "Umfang"),
-    ("hinweis", "Hinweis"),
+    ("zeitraum", "Zeitliche Verfügbarkeit"),
+    ("beschaeftigung", "Aktuelle Beschäftigung"),
+    ("sprachen", "Sprachen"),
 ]
+# Laengenbegrenzung je Feld. Sprachen mit Niveau brauchen etwas mehr Platz.
+VERFUEG_MAXLAENGE = {"zeitraum": 70, "beschaeftigung": 70, "sprachen": 140}
+# Werte, die nur "nichts bekannt" ausdruecken. Sie werden in der Tabelle grau gesetzt.
+LEERE_WERTE = ("unbekannt", "keine genannt", "keine angabe", "")
 
 
 def leere_verfuegbarkeit():
@@ -363,7 +443,11 @@ def leere_verfuegbarkeit():
 
 
 def verfuegbarkeit_der_reihe(reihe):
-    """Liest die gespeicherte Verfuegbarkeit, auch bei alten Eintraegen ohne sie."""
+    """Liest die gespeicherte Verfuegbarkeit, auch bei alten Eintraegen.
+
+    Aeltere Eintraege kennen noch die Felder ab und dauer. Sie werden im neuen
+    Feld zeitraum zusammengefuehrt, damit nichts verloren geht.
+    """
     try:
         roh = reihe["verfuegbarkeit"]
     except (IndexError, KeyError):
@@ -375,11 +459,21 @@ def verfuegbarkeit_der_reihe(reihe):
     except (ValueError, TypeError):
         return leere_verfuegbarkeit()
     grund = leere_verfuegbarkeit()
-    if isinstance(geladen, dict):
-        for schluessel, _ in VERFUEG_FELDER:
-            wert = str(geladen.get(schluessel, "")).strip()
-            if wert:
-                grund[schluessel] = wert
+    if not isinstance(geladen, dict):
+        return grund
+
+    def lesen(schluessel):
+        wert = str(geladen.get(schluessel, "")).strip()
+        return "" if wert.lower() in LEERE_WERTE else wert
+
+    for schluessel, _ in VERFUEG_FELDER:
+        wert = str(geladen.get(schluessel, "")).strip()
+        if wert:
+            grund[schluessel] = wert
+    if "zeitraum" not in geladen:
+        alt = ", ".join(t for t in (lesen("ab"), lesen("dauer")) if t)
+        if alt:
+            grund["zeitraum"] = alt
     return grund
 
 
@@ -390,18 +484,48 @@ def verfuegbarkeit_aus(daten):
         return leere_verfuegbarkeit()
     sauber = {}
     for schluessel, _ in VERFUEG_FELDER:
-        wert = str(roh.get(schluessel, "")).strip()[:60]
+        grenze = VERFUEG_MAXLAENGE.get(schluessel, 70)
+        wert = roh.get(schluessel)
+        wert = "" if wert is None else str(wert).strip()[:grenze]
         sauber[schluessel] = wert or "unbekannt"
     return sauber
 
 
+def fehler_text(fehler):
+    """Macht aus einem Fehler des KI-Aufrufs einen verstaendlichen deutschen Hinweis."""
+    art = type(fehler).__name__
+    roh = str(fehler)
+    klein = roh.lower()
+    if "credit balance" in klein or "billing" in klein:
+        return "Das Guthaben bei Anthropic ist aufgebraucht. Bitte in der Konsole aufladen."
+    if art == "AuthenticationError" or "invalid x-api-key" in klein:
+        return "Der API-Schluessel wird nicht akzeptiert. ANTHROPIC_API_KEY bei Railway pruefen."
+    if art == "NotFoundError" or "model" in klein and "not found" in klein:
+        return f"Das Modell \"{MODELL}\" wurde nicht gefunden. AI_MODEL bei Railway pruefen."
+    if art in ("RateLimitError", "InternalServerError", "APIConnectionError",
+               "APITimeoutError") or "overloaded" in klein:
+        return "Die KI ist gerade ueberlastet oder nicht erreichbar. Bitte spaeter erneut versuchen."
+    return f"{art}: {roh}"[:220]
+
+
 def bewerten(betreff, text):
+    """Bewertet eine Bewerbung. Bei Fehlern kommt ein Ergebnis mit Schluessel "fehler"."""
     if not API_KEY:
         return {k: 5 for k, _, _, _ in KRITERIEN} | {
             "fuehrerschein": "unbekannt",
             "verfuegbarkeit": leere_verfuegbarkeit(),
             "zusammenfassung": "Keine KI-Bewertung aktiv (ANTHROPIC_API_KEY fehlt).",
         }
+
+    def misslungen(hinweis, erstattet):
+        # erstattet: Der Aufruf selbst ist gescheitert, es ist also nichts angefallen.
+        return {k: 3 for k, _, _, _ in KRITERIEN} | {
+            "fuehrerschein": "unbekannt",
+            "verfuegbarkeit": leere_verfuegbarkeit(),
+            "zusammenfassung": f"Bewertung fehlgeschlagen. {hinweis}",
+            "fehler": hinweis, "erstattet": erstattet,
+        }
+
     try:
         import anthropic
 
@@ -410,17 +534,21 @@ def bewerten(betreff, text):
             model=MODELL,
             max_tokens=900,
             messages=[{"role": "user",
-                       "content": PROMPT.format(betreff=betreff, text=text[:12000])}],
+                       "content": PROMPT + f"Betreff: {betreff}\n\nText:\n{text[:12000]}"}],
         )
+    except Exception as fehler:
+        return misslungen(fehler_text(fehler), erstattet=True)
+
+    try:
         roh = "".join(b.text for b in antwort.content if b.type == "text")
         roh = re.sub(r"```(?:json)?|```", "", roh).strip()
         daten = json.loads(roh)
-    except Exception as fehler:
-        return {k: 3 for k, _, _, _ in KRITERIEN} | {
-            "fuehrerschein": "unbekannt",
-            "verfuegbarkeit": leere_verfuegbarkeit(),
-            "zusammenfassung": f"Bewertung fehlgeschlagen: {fehler}",
-        }
+        if not isinstance(daten, dict):
+            raise ValueError("keine JSON-Antwort")
+    except Exception:
+        # Die KI hat geantwortet und Geld gekostet, die Antwort war nur nicht lesbar.
+        return misslungen("Die KI-Antwort war nicht lesbar. Bitte erneut hochladen.",
+                          erstattet=False)
 
     ergebnis = {}
     for schluessel, _, _, _ in KRITERIEN:
@@ -428,9 +556,10 @@ def bewerten(betreff, text):
             ergebnis[schluessel] = max(1, min(10, int(round(float(daten.get(schluessel, 3))))))
         except Exception:
             ergebnis[schluessel] = 3
-    ergebnis["fuehrerschein"] = str(daten.get("fuehrerschein", "unbekannt"))[:20]
+    fuehrer = str(daten.get("fuehrerschein") or "").strip().lower()
+    ergebnis["fuehrerschein"] = fuehrer if fuehrer in ("ja", "nein") else "unbekannt"
     ergebnis["verfuegbarkeit"] = verfuegbarkeit_aus(daten)
-    ergebnis["zusammenfassung"] = str(daten.get("zusammenfassung", ""))[:500]
+    ergebnis["zusammenfassung"] = str(daten.get("zusammenfassung") or "")[:500]
     return ergebnis
 
 
@@ -455,14 +584,25 @@ class LimitErreicht(Exception):
 
 
 def verarbeiten(daten):
+    daten = dict(daten)
+    daten["name"] = sauber(daten.get("name"), 120) or "Unbekannt"
+    daten["absender"] = sauber(daten.get("absender"), 200)
+    daten["betreff"] = sauber(daten.get("betreff"), 300) or "(ohne Betreff)"
+    daten["text"] = STEUERZEICHEN.sub("", daten.get("text") or "")
     if API_KEY and not kontingent_buchen():
         raise LimitErreicht(
             f"Tageslimit von {TAGESLIMIT} Bewertungen erreicht. "
             "Morgen geht es weiter, oder das Limit bei Railway hochsetzen.")
     scores = bewerten(daten["betreff"], daten["text"])
-    note = gesamtnote(scores)
-    status = status_aus(note, scores)
-    nur_scores = {k: scores[k] for k, _, _, _ in KRITERIEN}
+    if scores.get("fehler"):
+        # Fehlgeschlagene Bewertung: klar markieren statt Dreier vorzutaeuschen.
+        if scores.get("erstattet") and API_KEY:
+            kontingent_zurueck()
+        note, status, nur_scores = 0, "fehler", {}
+    else:
+        note = gesamtnote(scores)
+        status = status_aus(note, scores)
+        nur_scores = {k: scores[k] for k, _, _, _ in KRITERIEN}
 
     verfuegbar = scores.get("verfuegbarkeit") or leere_verfuegbarkeit()
 
@@ -488,8 +628,21 @@ def verarbeiten(daten):
 
 # ---------------------------------------------------------------- Web
 
-app = FastAPI()
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 init()
+
+
+def regelmaessig_aufraeumen():
+    """Loescht alte Bewerbungen stuendlich, auch wenn niemand die Seite oeffnet."""
+    while True:
+        try:
+            aufraeumen()
+        except Exception:
+            pass
+        time.sleep(3600)
+
+
+threading.Thread(target=regelmaessig_aufraeumen, daemon=True).start()
 
 # --- Zutritt ---------------------------------------------------------------
 # Ein gemeinsames Passwort fuers Team. Wer es kennt, bekommt einen Cookie.
@@ -524,23 +677,57 @@ def fehlversuch(adresse):
             FEHLVERSUCHE.pop(schluessel, None)
 
 
+async def groesse_pruefen(request, call_next):
+    """Weist zu grosse Uploads ab, bevor sie eingelesen und zwischengespeichert werden."""
+    if request.method == "POST":
+        try:
+            laenge = int(request.headers.get("content-length", "0"))
+        except ValueError:
+            laenge = 0
+        if laenge > MAX_MB * 1024 * 1024 + 64 * 1024:     # etwas Luft fuer Formularkopf
+            return JSONResponse({"fehler": f"Datei groesser als {MAX_MB:g} MB. "
+                                           "Bitte kleiner speichern oder den Text einfuegen."}, 413)
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def tuersteher(request: Request, call_next):
     """Laesst nur durch, wer angemeldet ist. Gilt fuer jede Route."""
-    if not PASSWORT or request.url.path in OFFEN:
+    if request.url.path in OFFEN:
         return await call_next(request)
-    if secrets.compare_digest(request.cookies.get("zutritt", ""), MARKE):
-        return await call_next(request)
+    if not PASSWORT:
+        return await groesse_pruefen(request, call_next)
+    if secrets.compare_digest(request.cookies.get("zutritt", "").encode(), MARKE.encode()):
+        return await groesse_pruefen(request, call_next)
     if request.method == "GET" and not request.url.path.startswith("/api/"):
-        return RedirectResponse("/login", status_code=303)
+        ziel = request.url.path + (f"?{request.url.query}" if request.url.query else "")
+        if ziel == "/":
+            return RedirectResponse("/login", status_code=303)
+        return RedirectResponse(f"/login?weiter={quote(ziel, safe='')}", status_code=303)
     return JSONResponse({"fehler": "Nicht angemeldet. Seite neu laden."}, 401)
 
 
+LOGIN_MELDUNGEN = {
+    "passwort": "Passwort stimmt nicht.",
+    "gesperrt": "Zu viele Versuche. Bitte 15 Minuten warten.",
+}
+
+
+def sicheres_ziel(ziel):
+    """Nur Pfade dieser App sind als Ruecksprung erlaubt, keine fremden Seiten."""
+    if (ziel and re.fullmatch(r"/[A-Za-z0-9/_\-.?=&%]*", ziel)
+            and not ziel.startswith("//") and not ziel.startswith("/login")):
+        return ziel
+    return "/"
+
+
 @app.get("/login", response_class=HTMLResponse)
-def login_seite(fehler: str = ""):
+def login_seite(fehler: str = "", weiter: str = ""):
     if not PASSWORT:
         return RedirectResponse("/", status_code=303)
-    meldung = (f'<p class="warn">{fehler}</p>' if fehler else "")
+    text = LOGIN_MELDUNGEN.get(fehler, "")
+    meldung = f'<p class="warn">{text}</p>' if text else ""
+    meldung += (f'<input type="hidden" name="weiter" value="{html.escape(sicheres_ziel(weiter))}">')
     return (LOGIN.replace("{{FARBE_DUNKEL}}", abdunkeln(FARBE))
                  .replace("{{FARBE_HELL}}", FARBE_HELL)
                  .replace("{{AKZENT}}", AKZENT)
@@ -549,19 +736,40 @@ def login_seite(fehler: str = ""):
                  .replace("{{MELDUNG}}", meldung))
 
 
+def absender_adresse(request):
+    """Adresse des Besuchers. Hinter dem Railway-Proxy steht sie im letzten Eintrag
+    von X-Forwarded-For, den der Proxy selbst anhaengt (vorne kann jeder etwas faelschen)."""
+    weiter = request.headers.get("x-forwarded-for", "")
+    if weiter.strip():
+        return weiter.split(",")[-1].strip()
+    return request.client.host if request.client else "unbekannt"
+
+
 @app.post("/login")
-def anmelden(request: Request, passwort: str = Form("")):
-    adresse = request.client.host if request.client else "unbekannt"
+async def anmelden(request: Request):
+    # Formular selbst lesen und nach wenigen KB abbrechen: Diese Seite ist ohne
+    # Anmeldung erreichbar und darf keine grossen Datenmengen annehmen.
+    roh = b""
+    async for stueck in request.stream():
+        roh += stueck
+        if len(roh) > 4096:
+            return JSONResponse({"fehler": "Anfrage zu gross."}, 413)
+    felder = parse_qs(roh.decode("utf-8", errors="replace"))
+    passwort = (felder.get("passwort") or [""])[0]
+    weiter = (felder.get("weiter") or [""])[0]
+    adresse = absender_adresse(request)
+    ziel = sicheres_ziel(weiter)
+    zurueck = f"&weiter={quote(ziel, safe='')}" if ziel != "/" else ""
     if gesperrt(adresse):
         return RedirectResponse(
-            "/login?fehler=Zu+viele+Versuche.+Bitte+15+Minuten+warten.",
+            "/login?fehler=gesperrt" + zurueck,
             status_code=303)
-    if not secrets.compare_digest(passwort, PASSWORT):
+    if not secrets.compare_digest(passwort.encode(), PASSWORT.encode()):
         fehlversuch(adresse)
-        return RedirectResponse("/login?fehler=Passwort+stimmt+nicht.",
+        return RedirectResponse("/login?fehler=passwort" + zurueck,
                                 status_code=303)
     FEHLVERSUCHE.pop(adresse, None)
-    antwort = RedirectResponse("/", status_code=303)
+    antwort = RedirectResponse(ziel, status_code=303)
     antwort.set_cookie("zutritt", MARKE, max_age=30 * 24 * 3600,
                        httponly=True, samesite="lax", secure=True)
     return antwort
@@ -600,6 +808,26 @@ def logo():
     return JSONResponse({"fehler": "kein Logo hinterlegt"}, 404)
 
 
+def datei_auswerten(rohdaten, dateiname, endung):
+    """Liest Name, Absender und Text aus einer Datei. Gibt (daten, fehlertext) zurueck."""
+    if endung == "eml":
+        try:
+            return eml_lesen(rohdaten), ""
+        except Exception as fehler:
+            return None, f"Datei nicht lesbar: {sauber(fehler, 150)}"
+    if endung == "pdf":
+        text = pdf_zu_text(rohdaten)
+        if not text:
+            return None, ("Aus dieser PDF laesst sich kein Text lesen. "
+                          "Vermutlich ein Scan — bitte den Text von Hand einfuegen.")
+    elif endung in ("txt", "text", "md", "rtf"):
+        text = text_entschluesseln(rohdaten)
+    else:
+        return None, "Moegliche Formate: .eml, .pdf, .txt"
+    return {"name": name_raten(text, dateiname), "absender": mail_raten(text),
+            "betreff": f"Bewerbung ({dateiname})", "text": text}, ""
+
+
 @app.post("/api/upload")
 async def upload(file: UploadFile = File(...)):
     # Blockweise lesen und abbrechen, sobald die Grenze ueberschritten ist.
@@ -621,48 +849,34 @@ async def upload(file: UploadFile = File(...)):
     dateiname = file.filename or ""
     endung = dateiname.lower().rsplit(".", 1)[-1] if "." in dateiname else ""
 
-    if endung == "eml":
-        try:
-            daten = eml_lesen(rohdaten)
-        except Exception as fehler:
-            return JSONResponse({"fehler": f"Datei nicht lesbar: {fehler}"}, 400)
-
-    elif endung == "pdf":
-        text = pdf_zu_text(rohdaten)
-        if not text:
-            return JSONResponse(
-                {"fehler": "Aus dieser PDF laesst sich kein Text lesen. "
-                           "Vermutlich ein Scan — bitte den Text von Hand einfuegen."}, 400)
-        daten = {"name": name_raten(text, dateiname), "absender": mail_raten(text),
-                 "betreff": f"Bewerbung ({dateiname})", "text": text}
-
-    elif endung in ("txt", "text", "md", "rtf"):
-        text = rohdaten.decode("utf-8", errors="replace")
-        daten = {"name": name_raten(text, dateiname), "absender": mail_raten(text),
-                 "betreff": f"Bewerbung ({dateiname})", "text": text}
-
-    else:
-        return JSONResponse(
-            {"fehler": "Moegliche Formate: .eml, .pdf, .txt"}, 400)
+    daten, fehlertext = await run_in_threadpool(datei_auswerten, rohdaten, dateiname, endung)
+    if fehlertext:
+        return JSONResponse({"fehler": fehlertext}, 400)
 
     if not daten["text"].strip():
         return JSONResponse({"fehler": "Die Datei enthaelt keinen Text."}, 400)
     try:
-        return verarbeiten(daten)
+        return await run_in_threadpool(verarbeiten, daten)
     except LimitErreicht as grenze:
         return JSONResponse({"fehler": str(grenze)}, 429)
 
 
 @app.post("/api/text")
 async def per_hand(nutzlast: dict):
-    text = (nutzlast.get("text") or "").strip()
+    def feld(name, vorgabe="", laenge=200):
+        wert = nutzlast.get(name)
+        return (str(wert).strip() if wert is not None else "")[:laenge] or vorgabe
+
+    text = feld("text", laenge=10 ** 7)
     if not text:
         return JSONResponse({"fehler": "Kein Text angegeben."}, 400)
+    if len(text) > MAX_MB * 1024 * 1024:
+        return JSONResponse({"fehler": f"Text groesser als {MAX_MB:g} MB."}, 413)
     try:
-        return verarbeiten({
-            "name": (nutzlast.get("name") or "Unbekannt").strip(),
-            "absender": (nutzlast.get("absender") or "").strip(),
-            "betreff": (nutzlast.get("betreff") or "Bewerbung").strip(),
+        return await run_in_threadpool(verarbeiten, {
+            "name": feld("name", "Unbekannt"),
+            "absender": feld("absender"),
+            "betreff": feld("betreff", "Bewerbung"),
             "text": text,
         })
     except LimitErreicht as grenze:
@@ -675,7 +889,8 @@ def liste():
     aufraeumen()
     with conn() as c:
         reihen = c.execute(
-            "SELECT * FROM bewerbungen ORDER BY gesamt DESC, id DESC").fetchall()
+            "SELECT * FROM bewerbungen "
+            "ORDER BY (status = 'fehler') DESC, gesamt DESC, id DESC").fetchall()
 
     eintraege = []
     for reihe in reihen:
@@ -717,82 +932,230 @@ def mail_ansehen(eintrag_id: int):
             f"<body style='font-family:system-ui;padding:40px;max-width:600px;margin:auto'>"
             f"<h2>Nicht mehr vorhanden</h2><p>Bewerbungen werden nach "
             f"{AUFBEWAHRUNG_TAGE} Tagen automatisch geloescht.</p></body>", 404)
-    sicher = (reihe["text"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+    sicher = html.escape(reihe["text"] or "", quote=False)
+    note = ("Bewertung fehlgeschlagen" if reihe["status"] == "fehler"
+            else f"Gesamtnote {reihe['gesamt']}/10")
     return HTMLResponse(f"""<!doctype html><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <body style="font-family:system-ui,-apple-system,sans-serif;max-width:760px;margin:0 auto;padding:28px;color:#1c1c1a">
 <div style="background:{FARBE};color:#fff;padding:16px 20px;border-radius:12px">
-<div style="font-size:13px;opacity:.85">{reihe['betreff']}</div>
-<div style="font-size:20px;font-weight:600;margin-top:2px">{reihe['name']}</div></div>
-<p style="color:#6b6963;font-size:13px;margin:14px 0 4px">{reihe['absender']}</p>
-<p style="color:#6b6963;font-size:13px;margin:0 0 18px">Gesamtnote {reihe['gesamt']}/10</p>
+<div style="font-size:13px;opacity:.85">{html.escape(reihe['betreff'] or '')}</div>
+<div style="font-size:20px;font-weight:600;margin-top:2px">{html.escape(reihe['name'] or '')}</div></div>
+<p style="color:#6b6963;font-size:13px;margin:14px 0 4px">{html.escape(reihe['absender'] or '')}</p>
+<p style="color:#6b6963;font-size:13px;margin:0 0 18px">{note}</p>
 <pre style="white-space:pre-wrap;font:inherit;line-height:1.65;background:#faf9f7;border:1px solid #e6e3dd;border-radius:12px;padding:18px">{sicher}</pre>
 </body>""")
 
 
-@app.get("/api/excel")
-def excel():
-    aufraeumen()
-    with conn() as c:
-        reihen = c.execute(
-            "SELECT * FROM bewerbungen ORDER BY gesamt DESC, id DESC").fetchall()
+# ---------------------------------------------------------------- Excel
 
+def berlin_zeit(zeitpunkt):
+    """Rechnet eine UTC-Zeit in deutsche Ortszeit um (Sommerzeit nach EU-Regel)."""
+    def letzter_sonntag(monat):
+        tag = datetime(zeitpunkt.year, monat, 31, 1, 0, tzinfo=timezone.utc)
+        while tag.weekday() != 6:
+            tag -= timedelta(days=1)
+        return tag
+
+    sommer = letzter_sonntag(3) <= zeitpunkt < letzter_sonntag(10)
+    return (zeitpunkt + timedelta(hours=2 if sommer else 1)).replace(tzinfo=None, microsecond=0)
+
+
+def eingang_als_datum(iso):
+    """Wandelt den gespeicherten UTC-Zeitstempel in deutsche Ortszeit um."""
+    try:
+        d = datetime.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return berlin_zeit(d.astimezone(timezone.utc))
+
+
+def zeilen_noetig(text, breite):
+    """Schaetzt, wie viele Zeilen ein Text in einer Spalte dieser Breite braucht."""
+    if not text:
+        return 1
+    zeichen = max(8, int(breite * 1.1))
+    return sum(max(1, math.ceil(len(teil) / zeichen)) for teil in str(text).split("\n"))
+
+
+VERFUEG_BREITEN = {"zeitraum": 24, "beschaeftigung": 26, "sprachen": 36}
+
+
+def tabelle_bauen(reihen, basis):
     wb = Workbook()
     ws = wb.active
     ws.title = "Bewerbungen"
+    ws.sheet_view.showGridLines = False
 
-    kopfzeile = (["Status", "Name", "Absender", "Gesamt (1-10)"]
-                 + [t for _, t in VERFUEG_FELDER]
+    schrift = "Calibri"
+    linie = Side(style="thin", color="D9DEE3")
+    rand = Border(left=linie, right=linie, top=linie, bottom=linie)
+
+    anzahl_krit = len(KRITERIEN)
+    anzahl_verf = len(VERFUEG_FELDER)
+    kopfzeile = (["Status", "Name", "Absender", "Eingang", "Gesamt (1-10)"]
                  + [t for _, t, _, _ in KRITERIEN]
-                 + ["Fuehrerschein", "Zusammenfassung", "Einladung", "Mail"])
+                 + [t for _, t in VERFUEG_FELDER]
+                 + ["Führerschein", "Zusammenfassung", "Einladung", "Mail"])
 
-    rand = Border(*[Side(style="thin", color="BFBFBF")] * 4)
+    # Spaltenbreiten richten sich nach den Titeln, nicht nach festen Positionen.
+    def titelbreite(titel, mindest):
+        laengstes = max((len(w) for w in str(titel).split()), default=0)
+        return max(mindest, laengstes + 3)
+
+    breiten = [15, 22, 28, 17, 11]
+    breiten += [titelbreite(t, 12) for _, t, _, _ in KRITERIEN]
+    breiten += [VERFUEG_BREITEN.get(k, 22) for k, _ in VERFUEG_FELDER]
+    breiten += [14, 62, 12, 10]
+
+    spalte_krit_von = 6
+    spalte_krit_bis = 5 + anzahl_krit
+    spalte_verf_von = spalte_krit_bis + 1
+    spalte_verf_bis = spalte_krit_bis + anzahl_verf
+    spalte_fuehrer = spalte_verf_bis + 1
+    spalte_zusammen = spalte_fuehrer + 1
+    spalte_einladung = spalte_zusammen + 1
+    spalte_mail = spalte_einladung + 1
+
     for spalte, titel in enumerate(kopfzeile, 1):
         zelle = ws.cell(row=1, column=spalte, value=titel)
         zelle.fill = PatternFill("solid", start_color="2F4F4F")
-        zelle.font = Font(bold=True, color="FFFFFF", size=10)
-        zelle.alignment = Alignment("center", "center", wrap_text=True)
+        zelle.font = Font(name=schrift, bold=True, color="FFFFFF", size=10)
+        zelle.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         zelle.border = rand
-    ws.row_dimensions[1].height = 30
-
-    basis = os.environ.get("BASIS_URL", "").rstrip("/")
+        ws.column_dimensions[get_column_letter(spalte)].width = breiten[spalte - 1]
+    ws.row_dimensions[1].height = 34
 
     for nr, reihe in enumerate(reihen, start=2):
         scores = json.loads(reihe["scores"])
         verfuegbar = verfuegbarkeit_der_reihe(reihe)
         farbe, beschriftung = STATUS_FARBEN.get(reihe["status"], ("FFFFFF", ""))
-        werte = ([beschriftung, reihe["name"], reihe["absender"], reihe["gesamt"]]
-                 + [verfuegbar.get(k, "unbekannt") for k, _ in VERFUEG_FELDER]
+        hintergrund = "F6F8FA" if nr % 2 == 1 else "FFFFFF"
+        eingang = eingang_als_datum(reihe["angelegt"])
+
+        fehler = reihe["status"] == "fehler"
+        werte = ([beschriftung, reihe["name"], reihe["absender"], eingang,
+                  None if fehler else reihe["gesamt"]]
                  + [scores.get(k, "") for k, _, _, _ in KRITERIEN]
-                 + [reihe["fuehrerschein"], reihe["zusammenfassung"], ""])
+                 + [verfuegbar.get(k, "unbekannt") for k, _ in VERFUEG_FELDER]
+                 + [reihe["fuehrerschein"], reihe["zusammenfassung"], "", ""])
 
         for spalte, wert in enumerate(werte, 1):
+            if isinstance(wert, str):
+                wert = sauber(wert, 32000)
             zelle = ws.cell(row=nr, column=spalte, value=wert)
-            zelle.fill = PatternFill("solid", start_color=farbe)
+            if isinstance(wert, str) and wert.startswith("="):
+                zelle.data_type = "s"   # Fremder Text darf nie als Formel laufen.
             zelle.border = rand
-            zelle.alignment = Alignment(wrap_text=True, vertical="top")
+            zelle.fill = PatternFill("solid", start_color=hintergrund)
+            zelle.font = Font(name=schrift, size=10, color="1F2933")
+            zelle.alignment = Alignment(vertical="center", wrap_text=True)
 
-        link = ws.cell(row=nr, column=len(kopfzeile), value="Oeffnen")
-        link.hyperlink = f"{basis}/mail/{reihe['id']}"
-        link.font = Font(color="0563C1", underline="single")
-        link.fill = PatternFill("solid", start_color=farbe)
-        link.border = rand
-        link.alignment = Alignment("center", "center")
-        ws.row_dimensions[nr].height = 44
+        status = ws.cell(row=nr, column=1)
+        status.fill = PatternFill("solid", start_color=farbe)
+        status.font = Font(name=schrift, size=10, bold=True, color="1F2933")
+        status.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    breiten = ([14, 22, 26, 12] + [14, 15, 13, 22]
-               + [11] * len(KRITERIEN) + [13, 46, 11, 10])
-    for i, breite in enumerate(breiten, 1):
-        ws.column_dimensions[get_column_letter(i)].width = breite
-    ws.freeze_panes = "B2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(kopfzeile))}{max(1, len(reihen) + 1)}"
+        gesamt = ws.cell(row=nr, column=5)
+        gesamt.fill = PatternFill("solid", start_color=farbe)
+        gesamt.font = Font(name=schrift, size=12, bold=True, color="1F2933")
+        gesamt.number_format = "0.0"
+        gesamt.alignment = Alignment(horizontal="center", vertical="center")
 
-    hinweis = len(reihen) + 3
+        ws.cell(row=nr, column=4).number_format = "DD.MM.YYYY HH:MM"
+        ws.cell(row=nr, column=4).alignment = Alignment(horizontal="center", vertical="center")
+
+        for spalte in range(spalte_krit_von, spalte_krit_bis + 1):
+            zelle = ws.cell(row=nr, column=spalte)
+            zelle.alignment = Alignment(horizontal="center", vertical="center")
+            zelle.font = Font(name=schrift, size=11, bold=True, color="1F2933")
+            zelle.number_format = "0"
+
+        # "unbekannt" tritt in den Hintergrund, damit echte Angaben auffallen.
+        for spalte in range(spalte_verf_von, spalte_verf_bis + 1):
+            zelle = ws.cell(row=nr, column=spalte)
+            if str(zelle.value).strip().lower() in LEERE_WERTE:
+                zelle.font = Font(name=schrift, size=10, italic=True, color="9AA0A6")
+
+        fuehrer = ws.cell(row=nr, column=spalte_fuehrer)
+        fuehrer.alignment = Alignment(horizontal="center", vertical="center")
+        wert_f = str(fuehrer.value or "").strip().lower()
+        if wert_f in LEERE_WERTE:
+            fuehrer.font = Font(name=schrift, size=10, italic=True, color="9AA0A6")
+        elif wert_f == "nein":
+            fuehrer.font = Font(name=schrift, size=10, bold=True, color="B42318")
+        ws.cell(row=nr, column=spalte_zusammen).alignment = Alignment(
+            vertical="center", wrap_text=True)
+
+        link = ws.cell(row=nr, column=spalte_mail)
+        link.alignment = Alignment(horizontal="center", vertical="center")
+        if basis:
+            link.value = "Öffnen"
+            link.hyperlink = f"{basis}/mail/{reihe['id']}"
+            link.font = Font(name=schrift, size=10, color="0563C1", underline="single")
+
+        zeilen = max(
+            zeilen_noetig(reihe["zusammenfassung"], breiten[spalte_zusammen - 1]),
+            zeilen_noetig(verfuegbar.get("sprachen", ""),
+                          breiten[spalte_verf_bis - 1]),
+            2,
+        )
+        ws.row_dimensions[nr].height = min(150, 13.5 * zeilen + 8)
+
+    letzte = len(reihen) + 1
+    if reihen:
+        # Farbskala von Rot (1) ueber Gelb zu Gruen (10), gleich fuer alle Kriterien.
+        bereich = (f"{get_column_letter(spalte_krit_von)}2:"
+                   f"{get_column_letter(spalte_krit_bis)}{letzte}")
+        ws.conditional_formatting.add(bereich, ColorScaleRule(
+            start_type="num", start_value=1, start_color="F8A5A5",
+            mid_type="num", mid_value=5.5, mid_color="FFE699",
+            end_type="num", end_value=10, end_color="8FD19E"))
+
+        # Auswahlliste fuer die Spalte "Einladung", damit man sie schnell pflegen kann.
+        auswahl = DataValidation(type="list", formula1='"Ja,Nein,Offen"', allow_blank=True)
+        ws.add_data_validation(auswahl)
+        spalte_e = get_column_letter(spalte_einladung)
+        auswahl.add(f"{spalte_e}2:{spalte_e}{letzte}")
+        for nr in range(2, letzte + 1):
+            ws.cell(row=nr, column=spalte_einladung).alignment = Alignment(
+                horizontal="center", vertical="center")
+
+    ws.freeze_panes = "C2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(kopfzeile))}{max(1, letzte)}"
+
+    hinweis = letzte + 2
     ws.cell(row=hinweis, column=1,
-            value=f"Mail-Links sind {AUFBEWAHRUNG_TAGE} Tage gueltig. "
-                  f"Stand: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
-            ).font = Font(size=9, italic=True, color="888888")
+            value=f"Mail-Links sind {AUFBEWAHRUNG_TAGE} Tage gültig. "
+                  f"Stand: {berlin_zeit(datetime.now(timezone.utc)).strftime('%d.%m.%Y %H:%M')}"
+            ).font = Font(name=schrift, size=9, italic=True, color="888888")
 
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.paperSize = 9
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+    ws.print_title_rows = "1:1"
+    return wb
+
+
+@app.get("/api/excel")
+def excel(request: Request):
+    aufraeumen()
+    with conn() as c:
+        reihen = c.execute(
+            "SELECT * FROM bewerbungen "
+            "ORDER BY (status = 'fehler') DESC, gesamt DESC, id DESC").fetchall()
+
+    # Adresse fuer die Mail-Links: Einstellung oder die Adresse, unter der die App gerade laeuft.
+    basis = os.environ.get("BASIS_URL", "").rstrip("/")
+    if not basis:
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+        basis = f"https://{host}" if host else ""
+
+    wb = tabelle_bauen(reihen, basis)
     puffer = io.BytesIO()
     wb.save(puffer)
     puffer.seek(0)
@@ -800,7 +1163,7 @@ def excel():
         puffer,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition":
-                 f'attachment; filename="bewerbungen_{datetime.now():%Y-%m-%d}.xlsx"'},
+                 f'attachment; filename="bewerbungen_{heute()}.xlsx"'},
     )
 
 
@@ -973,8 +1336,9 @@ white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .blocktitel{margin:15px 0 8px;font-size:12px;font-weight:700;letter-spacing:.09em;
 text-transform:uppercase;color:#8fa2c2}
 .verf{list-style:none;margin:0;padding:0;display:grid;gap:6px}
-.verf li{display:flex;align-items:baseline;gap:10px;font-size:14px}
-.verf li b{flex:0 0 78px;font-weight:500;color:#7e8ca6;font-size:13px}
+.verf li{display:grid;grid-template-columns:minmax(120px,175px) 1fr;align-items:baseline;
+gap:12px;font-size:14px}
+.verf li b{font-weight:500;color:#7e8ca6;font-size:13px}
 .verf li span{color:#12224a;font-weight:500}
 .verf li.offen span{color:#9aa9c2;font-weight:400;font-style:italic}
 .fazit{font-size:14px;color:#48566e;margin:14px 0 0}
@@ -1052,7 +1416,8 @@ const VERF=[{{VERFLISTE}}];
 const PILL={gruen:['#d9efdc','#2a6b36','Einladen','#4f8a3d'],
 gelb:['#faeecb','#8a6410','Prüfen','#e0a423'],
 grau:['#ebe9e3','#5f5c56','Angaben fehlen','#a8b0bf'],
-rot:['#f8dcd9','#9c3229','Unpassend','#c4483f']};
+rot:['#f8dcd9','#9c3229','Unpassend','#c4483f'],
+fehler:['#fde8d4','#9a4a0b','Fehlgeschlagen','#e07b24']};
 const offeneZeilen=new Set();
 
 ['dragenter','dragover'].forEach(e=>zone.addEventListener(e,v=>{
@@ -1063,8 +1428,13 @@ zone.addEventListener('drop',v=>{if(v.dataTransfer.files.length)stapel(v.dataTra
 datei.addEventListener('change',()=>{if(datei.files.length)stapel(datei.files)});
 
 function handForm(){document.getElementById('hand').classList.toggle('aus')}
-function fehler(t){document.getElementById('fehler').innerHTML=
-t?'<div class="fehler">'+t+'</div>':''}
+function fehler(t){const ort=document.getElementById('fehler');ort.innerHTML='';
+if(!t)return;const box=document.createElement('div');box.className='fehler';
+box.style.whiteSpace='pre-line';box.textContent=t;ort.appendChild(box)}
+async function antwortLesen(a){
+if(a.status===401){location.href='/login';throw new Error('Nicht angemeldet.')}
+try{return await a.json()}
+catch(e){return{fehler:'Server antwortet nicht richtig (Code '+a.status+'). Bitte erneut versuchen.'}}}
 function farbe(n){return n>=7?'#4f8a3d':n>=4?'#c98a1e':'#c4483f'}
 
 function fortschritt(an,text,anteil){
@@ -1082,11 +1452,11 @@ fortschritt(true,liste.length>1?('Verarbeite '+(i+1)+' von '+liste.length+': '+f
 :'Wird ausgewertet …',Math.round(i/liste.length*100));
 try{const fd=new FormData();fd.append('file',f);
 const a=await fetch('/api/upload',{method:'POST',body:fd});
-const d=await a.json();
+const d=await antwortLesen(a);
 if(!a.ok)throw new Error(d.fehler||'Fehler');
 }catch(e){probleme.push(f.name+': '+e.message)}}
 fortschritt(false);datei.value='';
-if(probleme.length)fehler('Nicht verarbeitet<br>'+probleme.join('<br>'));
+if(probleme.length)fehler('Nicht verarbeitet\\n'+probleme.join('\\n'));
 await ladeListe()}
 
 async function sendeText(){
@@ -1098,7 +1468,7 @@ headers:{'Content-Type':'application/json'},body:JSON.stringify({
 name:document.getElementById('h-name').value,
 absender:document.getElementById('h-mail').value,
 betreff:document.getElementById('h-betreff').value,text:text})});
-const d=await a.json();if(!a.ok)throw new Error(d.fehler||'Fehler');
+const d=await antwortLesen(a);if(!a.ok)throw new Error(d.fehler||'Fehler');
 ['h-name','h-mail','h-betreff','h-text'].forEach(i=>document.getElementById(i).value='');
 document.getElementById('hand').classList.add('aus')}
 catch(e){fehler(e.message)}
@@ -1107,11 +1477,12 @@ finally{fortschritt(false);await ladeListe()}}
 function kurzInfo(v){
 const teile=[];
 VERF.forEach(f=>{const w=(v[f[0]]||'').trim();
-if(w&&w.toLowerCase()!=='unbekannt'&&f[0]!=='hinweis')teile.push(w)});
+if(w&&w.toLowerCase()!=='unbekannt'&&f[0]!=='sprachen')teile.push(w)});
 return teile.length?teile.join(' · '):'keine Angaben zur Verfügbarkeit'}
 
 async function ladeListe(){
-let d;try{d=await(await fetch('/api/liste')).json()}catch(e){return}
+let d;try{const a=await fetch('/api/liste');d=await antwortLesen(a);
+if(!a.ok||!Array.isArray(d.eintraege))return}catch(e){return}
 const ziel=document.getElementById('t-inhalt');
 document.getElementById('t-zahl').textContent=
 d.anzahl===0?'noch keine':(d.anzahl===1?'1 Bewerbung':d.anzahl+' Bewerbungen');
@@ -1132,19 +1503,21 @@ kopf.innerHTML='<div class="ampel" style="background:'+p[3]+'"></div>'+
 '<div class="wert"><b></b><small>'+p[2]+'</small></div>'+
 '<div class="pfeilchen">▶</div>';
 kopf.querySelector('.wer b').textContent=e.name||'Unbekannt';
-kopf.querySelector('.wer small').textContent=kurzInfo(e.verfuegbarkeit||{});
-kopf.querySelector('.wert b').textContent=e.gesamt;
+kopf.querySelector('.wer small').textContent=e.status==='fehler'
+?'Bewertung fehlgeschlagen, zum Lesen aufklappen':kurzInfo(e.verfuegbarkeit||{});
+kopf.querySelector('.wert b').textContent=e.status==='fehler'?'–':e.gesamt;
 reihe.appendChild(kopf);
 
 const det=document.createElement('div');det.className='detail';
-KRIT.forEach(k=>{const v=e.scores[k[0]]||0;
+if(e.status!=='fehler')KRIT.forEach(k=>{const v=e.scores[k[0]]||0;
 const z=document.createElement('div');z.className='zeile';
-z.innerHTML='<div class="lab"><span>'+k[1]+'<em>'+k[2]+'%</em></span><b>'+v+'</b></div>'+
-'<div class="spur"><i style="width:'+(v*10)+'%;background:'+farbe(v)+'"></i></div>';
+z.innerHTML='<div class="lab"><span><s></s><em>'+Number(k[2])+'%</em></span><b>'+Number(v)+'</b></div>'+
+'<div class="spur"><i style="width:'+(Number(v)*10)+'%;background:'+farbe(v)+'"></i></div>';
+const nameKrit=z.querySelector('.lab s');nameKrit.replaceWith(document.createTextNode(k[1]));
 det.appendChild(z)});
 
-const vt=document.createElement('p');vt.className='blocktitel';
-vt.textContent='Verfügbarkeit';det.appendChild(vt);
+if(e.status!=='fehler'){const vt=document.createElement('p');vt.className='blocktitel';
+vt.textContent='Eckdaten';det.appendChild(vt);
 const ul=document.createElement('ul');ul.className='verf';
 VERF.forEach(f=>{const w=((e.verfuegbarkeit||{})[f[0]]||'unbekannt').trim();
 const leer=w.toLowerCase()==='unbekannt';
@@ -1152,7 +1525,7 @@ const li=document.createElement('li');if(leer)li.className='offen';
 const b=document.createElement('b');b.textContent=f[1];
 const s=document.createElement('span');s.textContent=leer?'keine Angabe':w;
 li.appendChild(b);li.appendChild(s);ul.appendChild(li)});
-det.appendChild(ul);
+det.appendChild(ul)}
 
 const fz=document.createElement('p');fz.className='fazit';
 fz.textContent=e.zusammenfassung||'';det.appendChild(fz);
@@ -1168,7 +1541,9 @@ let sicher=false;
 del.onclick=async ev=>{ev.stopPropagation();
 if(!sicher){sicher=true;del.textContent='Wirklich entfernen?';
 setTimeout(()=>{sicher=false;del.textContent='🗑 Entfernen'},4000);return}
-await fetch('/api/loeschen/'+e.id,{method:'POST'});
+try{const a=await fetch('/api/loeschen/'+e.id,{method:'POST'});
+if(!a.ok){const d=await antwortLesen(a);throw new Error(d.fehler||'Fehler')}}
+catch(x){fehler('Entfernen fehlgeschlagen: '+x.message);return}
 offeneZeilen.delete(e.id);ladeListe()};
 kn.appendChild(del);det.appendChild(kn);
 
@@ -1177,7 +1552,10 @@ reihe.appendChild(det);ziel.appendChild(reihe)})}
 ladeListe();
 </script></body></html>"""
 
-SEITE = SEITE.replace("{{KRITLISTE}}",
-                      ",".join(f"['{k}','{t}',{g}]" for k, t, g, _ in KRITERIEN))
-SEITE = SEITE.replace("{{VERFLISTE}}",
-                      ",".join(f"['{k}','{t}']" for k, t in VERFUEG_FELDER))
+def fuer_skript(wert):
+    """Wandelt Python-Daten in sicheres JavaScript, auch bei Sonderzeichen."""
+    return json.dumps(wert, ensure_ascii=False)[1:-1].replace("</", "<\\/")
+
+
+SEITE = SEITE.replace("{{KRITLISTE}}", fuer_skript([[k, t, g] for k, t, g, _ in KRITERIEN]))
+SEITE = SEITE.replace("{{VERFLISTE}}", fuer_skript([[k, t] for k, t in VERFUEG_FELDER]))

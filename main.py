@@ -54,7 +54,7 @@ AUFBEWAHRUNG_TAGE = 3
 
 DB = os.environ.get("DB_PATH", "/tmp/bewerbungen.db")
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-MODELL = os.environ.get("AI_MODEL", "claude-haiku-5-5")
+MODELL = os.environ.get("AI_MODEL", "claude-sonnet-4-6")
 
 # --- Schutz gegen Missbrauch und ausufernde Kosten ---
 PASSWORT = os.environ.get("PASSWORT", "")
